@@ -1,0 +1,19 @@
+*.elc
+*.eln
+eln-cache/
+manual/*.info
+manual/*.html
+manual/dir
+/result
+/result-*
+.direnv/
+.envrc.local
+
+# Editor scratch
+.\#*
+\#*\#
+*~
+
+# Test artifacts
+/test/tmp/
+/test/*.log

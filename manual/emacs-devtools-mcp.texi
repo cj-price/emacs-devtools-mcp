@@ -1,0 +1,64 @@
+\input texinfo
+@c %**start of header
+@setfilename emacs-devtools-mcp.info
+@settitle emacs-devtools-mcp
+@documentencoding UTF-8
+@documentlanguage en
+@c %**end of header
+
+@copying
+Copyright @copyright{} 2026 C.J. Price.
+
+This manual is free documentation; you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation; either version 3, or (at your option) any later version.
+@end copying
+
+@dircategory Emacs misc features
+@direntry
+* emacs-devtools-mcp: (emacs-devtools-mcp). Devtools MCP server for Emacs.
+@end direntry
+
+@titlepage
+@title emacs-devtools-mcp
+@subtitle An MCP server for introspecting and debugging Emacs from a coding agent
+@author C.J. Price
+@page
+@vskip 0pt plus 1filll
+@insertcopying
+@end titlepage
+
+@contents
+
+@ifnottex
+@node Top
+@top emacs-devtools-mcp
+
+This manual describes @code{emacs-devtools-mcp}, a Model Context Protocol
+server that runs inside Emacs and lets a coding agent inspect frames,
+keymaps, faces, buffers, and init.el.
+
+This is a pre-alpha skeleton; sections will be filled in as tool stories
+land.
+
+@menu
+* Introduction::
+* Index::
+@end menu
+@end ifnottex
+
+@node Introduction
+@chapter Introduction
+
+@code{emacs-devtools-mcp} aims to do for Emacs what
+@uref{https://github.com/ChromeDevTools/chrome-devtools-mcp,
+chrome-devtools-mcp} does for Chrome: give an LLM-driven coding agent a
+structured set of tools for inspecting state, exercising input, and
+verifying that changes actually rendered.
+
+@node Index
+@unnumbered Index
+
+@printindex cp
+
+@bye
