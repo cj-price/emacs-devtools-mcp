@@ -39,6 +39,12 @@
 (require 'emacs-devtools-mcp-server)
 (require 'emacs-devtools-mcp-spawn)
 
+;; `x-export-frames' is defined in C (xfns.c) only when Emacs is built
+;; with X/PGTK/NS support.  Tell the byte compiler so a no-X build can
+;; still byte-compile this file; the runtime backend probe gates the
+;; actual call.
+(declare-function x-export-frames "xfns" (&optional frames type))
+
 (defcustom emacs-devtools-mcp-faces-page-size 100
   "Default page size for `list-faces'."
   :type 'natnum

@@ -199,7 +199,7 @@ Cancels outstanding continuations and runs the connection's
                              (list :code -1
                                    :message "Connection died"))))))
             (jsonrpc--continuations conn))
-      (setf (jsonrpc--continuations conn) nil)
+      (jsonrpc-forget-pending-continuations conn)
       (ignore-errors
         (funcall (edmcp--rpc-on-shutdown conn) conn)))))
 
