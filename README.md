@@ -7,8 +7,8 @@ windows, buffers, faces, keymaps, hooks, advice, the message log, the
 [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 gives an agent for the browser, but for Emacs.
 
-**Status**: 0.1.0 — feature-complete for the v1 tool surface (36 tools across
-8 categories). Pre-release; no public API stability guarantees yet. Tested on
+**Status**: 0.1.0 — feature-complete for the v1 tool surface (33 tools across
+7 categories). Pre-release; no public API stability guarantees yet. Tested on
 Emacs 30.1.
 
 ## What you can ask an agent to do
@@ -30,7 +30,6 @@ agent ──stdio──▶ bin/emacs-devtools-mcp ──unix socket──▶ Hos
    newline-delimited JSON-RPC         │
    per the MCP stdio spec             └─ make-process argv list ──▶ subordinate Emacs
                                           emacs -Q --bg-daemon=NAME
-                                          (optional: under `xvfb-run`)
 ```
 
 - Pure-Elisp server runs inside the user's Emacs — no external runtime.
@@ -46,8 +45,9 @@ agent ──stdio──▶ bin/emacs-devtools-mcp ──unix socket──▶ Hos
 
 ## Installing
 
-You need: Emacs ≥30.1, `socat`, `jq`, and (for headless / GUI tests) `xvfb-run`
-and `grim`. The repo ships a `shell.nix` that pins all of those.
+You need: Emacs ≥30.1 (graphical build, for `x-export-frames`), `socat`, and
+`jq`. `xvfb-run` is needed only to run `make test-gui`. The repo ships a
+`shell.nix` that pins all of those.
 
 ```sh
 git clone https://github.com/cjprice/emacs-devtools-mcp.git
@@ -135,7 +135,7 @@ return `next_cursor` when more results remain. JSON keys are `snake_case`.
 
 | Tool | Description |
 |---|---|
-| `screenshot_frame` | Export FRAME as a base64 PNG MCP image content block. Pgtk/Wayland fallback to `grim`. |
+| `screenshot_frame` | Export FRAME as a base64 PNG MCP image content block via `x-export-frames` (graphical Emacs builds only; errors on builds where the probe fails). |
 | `get_frame_tree` | frames → windows → buffer metadata. |
 | `face_at` | Face at a 1-based line + 0-based column in a buffer. |
 | `describe_face` | Inheritance-resolved attributes plus docstring. |
@@ -165,7 +165,7 @@ ones you are most likely to touch:
 | `emacs-devtools-mcp-spawn-idle-timeout` | `1800` | Reaper kills idle handles after this many seconds. |
 | `emacs-devtools-mcp-spawn-max-handles` | `4` | Cap on simultaneous subordinate daemons. |
 | `emacs-devtools-mcp-slow-tool-timeout` | `25` | `with-timeout` cap for `:slow` tools. |
-| `emacs-devtools-mcp-bisect-max-probes` | `12` | Hard cap on `bisect_init` iterations. |
+| `emacs-devtools-mcp-bisect-max-probes` | `32` | Hard cap on `bisect_init` iterations. |
 | `emacs-devtools-mcp-init-batch-timeout` | `30` | Per-probe timeout in `emacs --batch`. |
 | `emacs-devtools-mcp-redact-extra-regexps` | `nil` | Additional patterns to scrub from any *Messages* / backtrace output. |
 

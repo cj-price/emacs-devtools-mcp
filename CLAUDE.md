@@ -2,7 +2,7 @@
 
 An MCP server that gives coding agents the same kind of "open the inspector and poke at it" loop for Emacs that `chrome-devtools-mcp` gives them for the browser. Used to debug `~/.config/emacs/init.el`, verify GUI rendering, and check that keybinds resolve to the intended commands.
 
-**Quality bar**: the magit-grade conventions that pay rent on a single-developer Elisp package — `lexical-binding`, byte-compile-and-checkdoc-clean, transient dispatcher, real-process tests, texinfo manual once tools stabilize. **Not** the conventions that exist because magit serves hundreds of thousands of users (full GPLv3-per-file boilerplate, AUTHORS file, CODE_OF_CONDUCT pre-contributors, `NEWS` scaffolding for a v0.1.0).
+**Quality bar**: the magit-grade conventions that pay rent on a single-developer Elisp package — `lexical-binding`, byte-compile-and-checkdoc-clean, real-process tests, texinfo manual. **Not** the conventions that exist because magit serves hundreds of thousands of users (full GPLv3-per-file boilerplate, AUTHORS file, CODE_OF_CONDUCT pre-contributors, `NEWS` scaffolding for a v0.1.0).
 
 ## Architecture
 
@@ -11,7 +11,6 @@ agent ──stdio──▶ bin/emacs-devtools-mcp ──unix socket──▶ Hos
    newline-delimited JSON-RPC                                     │
    per MCP stdio spec                                             └─ make-process argv list ──▶ subordinate Emacs
                                                                      emacs -Q --bg-daemon=NAME
-                                                                     (optionally `xvfb-run --auto-servernum`)
 ```
 
 - Pure Elisp server runs **inside** the user's Emacs (no external runtime).
@@ -27,23 +26,23 @@ MCP stdio is **newline-delimited JSON** per spec, not Content-Length-framed. `js
 
 ```
 lisp/
-  emacs-devtools-mcp.el              ;;;###autoload entry, defgroup, transient dispatcher
+  emacs-devtools-mcp.el              defgroup hierarchy + eval-after-load auto-requires
   emacs-devtools-mcp-server.el       newline JSON-RPC over Unix socket; tool registry; cursor store
   emacs-devtools-mcp-rpc.el          JSON encode/decode; error envelope; redaction layer
   emacs-devtools-mcp-auth.el         SO_PEERCRED check; per-launch token; init-path allowlist
   emacs-devtools-mcp-spawn.el        spawn/attach/kill subordinate Emacs; idle reaper
-  emacs-devtools-mcp-tools-gui.el    screenshots (pgtk/Wayland fallback), frame tree, faces, contrast
+  emacs-devtools-mcp-tools-spawn.el  spawn-emacs / attach-emacs / kill-emacs / list-handles
+  emacs-devtools-mcp-tools-gui.el    screenshots (x-export-frames), frame tree, faces, contrast
   emacs-devtools-mcp-tools-keys.el   where-is, lookup, simulate, translation trace
   emacs-devtools-mcp-tools-eval.el   eval, edebug, capture-backtrace, trace
   emacs-devtools-mcp-tools-init.el   bisect, init-lint, startup-profile
   emacs-devtools-mcp-tools-buffer.el buffer state, list-messages, list-warnings, ert
 bin/emacs-devtools-mcp               POSIX sh + socat stdio↔socket relay
-manual/emacs-devtools-mcp.texi       texinfo source — drafted alongside tools, not before
+manual/emacs-devtools-mcp.texi       texinfo source
 test/
-  emacs-devtools-mcp-tests.el        behavior-organized; the bulk
-  emacs-devtools-mcp-spawn-tests.el  :daemon / :fresh-daemon
-  emacs-devtools-mcp-xvfb-tests.el   :gui
-shell.nix                            emacs 30, xvfb-run, socat, gnumake, texinfo, grim, jq, rg, fd
+  emacs-devtools-mcp-tests.el        behavior-organized; one file, section banners per subsystem
+  e2e-smoke.sh                       end-to-end MCP smoke driver (`make test-mcp`)
+shell.nix                            emacs 30, xvfb-run, socat, gnumake, texinfo, jq, rg, fd
 Makefile                             all | lisp | test | test-fast | test-daemon | test-gui | test-mcp | lint | manual | clean | install
 .github/workflows/ci.yml             emacs 30.1
 CHANGELOG  CONTRIBUTING.md  LICENSE  README.md
@@ -97,9 +96,9 @@ Every user-facing knob: `defcustom` with `:group`, `:type`, `:package-version '(
 
 Key defcustoms: `emacs-devtools-mcp-max-response-bytes` (256 KiB), `screenshot-max-pixels` (1920×1080), `spawn-idle-timeout` (1800 s), `max-handles` (4), `slow-tool-timeout` (25 s), `init-allowlist` (~/.config/emacs, ~/.emacs.d, project root), `redact-extra-regexps`.
 
-## Keymaps & menus
+## User entry points
 
-`defvar-keymap`. User entry point is `M-x emacs-devtools-mcp` — a `transient-define-prefix` with start/stop, list/kill handles, run tests, customize. Autoload cookies on the dispatcher and `emacs-devtools-mcp-{start,stop}` only; **not** every tool. Magit doesn't autoload its entire surface either.
+The two `;;;###autoload` symbols are `emacs-devtools-mcp-server-start` and `emacs-devtools-mcp-server-stop` (`lisp/emacs-devtools-mcp-server.el`). There is no keymap and no menu — agents drive the package, not interactive users. Tool handlers themselves are not autoloaded; `(require 'emacs-devtools-mcp)` pulls in the tool subsystems via `eval-after-load`.
 
 ## Tool registration
 
@@ -159,17 +158,16 @@ Text/binary tools (`buffer-substring`, `screenshot-frame`) take a `max_bytes` an
 
 - `--bg-daemon=NAME` (not `--fg-daemon`; the latter blocks `make-process`).
 - `make-process` with **explicit argv list** everywhere. Never `start-process-shell-command`. `server_name` validated against `[A-Za-z0-9_-]+`.
-- `xvfb-run --auto-servernum --server-args="-nolisten tcp -nolisten unix"` + private `XAUTHORITY` per spawn.
 - Init paths from agent are validated against `emacs-devtools-mcp-init-allowlist`: `expand-file-name` + `file-truename` then prefix-match.
 - Idle timeout (default 30 min); `max-handles` cap (default 4); reaper runs on a timer and on `kill-emacs-hook`. `list-handles` includes `idle_seconds` + `expires_at`.
 - `emacsclient --eval` results parsed under `(let ((read-eval nil)) (read ...))` to neutralize `#.` reader-macro injection.
-- `bisect-init` holds a persistent pipe to the subordinate's server socket (not one `emacsclient` per probe) to amortize the ~20-50 ms fork-cost across dozens of calls.
+- `init-lint`, `startup-profile`, and `bisect-init` each run their probe in a fresh `emacs -Q --batch` subprocess (no daemon attach, no persistent client). `bisect-init` is capped at `emacs-devtools-mcp-bisect-max-probes` (default 32) iterations and each probe at `emacs-devtools-mcp-init-batch-timeout` seconds (default 30).
 
-## Screenshots — Wayland / pgtk fallback
+## Screenshots
 
-Host Emacs build is detected at server-start. A probe creates a hidden test frame and tries `x-export-frames`; if it returns valid PNG bytes the host path uses it. Otherwise (or if probe fails on pgtk in some configurations) falls back to **`grim -g <frame-bounds>`** on Wayland or `xwd | convert` on X11, cropped to `frame-position` + `frame-pixel-{width,height}`. Backend cached in `emacs-devtools-mcp-tools-gui--host-backend`. Spawn target always uses `x-export-frames` (the Xvfb daemon is X11).
+Host Emacs build is probed lazily on the first `screenshot-frame` call. A trial `x-export-frames nil 'png` either returns valid PNG bytes (sets `emacs-devtools-mcp-tools-gui--host-backend` to `'x-export-frames` and uses it from then on) or sets the backend to `'unavailable` and the tool returns a structured error. Frames whose pixel area exceeds `emacs-devtools-mcp-screenshot-max-pixels` are refused before encoding.
 
-`screenshot-frame` returns an MCP `image` content block (`{type: "image", data, mimeType}`) — not a custom envelope.
+`screenshot-frame` returns the standard MCP `image` content block (`{type: "image", data, mimeType}`) — no custom envelope, no width/height sidecar.
 
 ## Build / test contract
 
@@ -189,9 +187,8 @@ CI: Emacs 30.1. `make all` + `make test-mcp` on every push. Build fails on any b
 
 ## Tests
 
-- **One** behavior-organized file: `test/emacs-devtools-mcp-tests.el` with `;;; ___Section___` banners (Server, RPC, Spawn, GUI, Keys, Eval, Init, Buffer). Magit's pattern. Cross-cutting tests live alongside the behavior they cover.
-- Slow / spawn-dependent: `emacs-devtools-mcp-spawn-tests.el`. GUI: `emacs-devtools-mcp-xvfb-tests.el`.
-- ERT tag selectors mandatory: `:fast`, `:daemon`, `:fresh-daemon`, `:gui`. Pure-logic tests must be `:fast`.
+- **One** behavior-organized file: `test/emacs-devtools-mcp-tests.el` with `;;; ___Section___` banners (Server, RPC, Spawn, GUI, Keys, Eval, Init, Buffer). Magit's pattern. Cross-cutting tests live alongside the behavior they cover. End-to-end MCP-protocol coverage lives in `test/e2e-smoke.sh`, run via `make test-mcp`.
+- ERT tag selectors mandatory: `:fast`, `:daemon`, `:fresh-daemon`, `:gui`. `make test-{fast,daemon,gui}` filter on these. Pure-logic tests must be `:fast`.
 - Property tests for pure functions (color-contrast math, RPC encode/decode round-trip, schema validator, redaction) using `propcheck` (test-only `Package-Requires`).
 - **"No mocks" — narrow form**: don't mock the system under test (Emacs, emacsclient, sockets, file system). Auxiliary stubbing with `cl-letf` (e.g., faking `read-passwd`, `current-time`, `random`) is fine — magit does this. Real git, real Emacs.
 - **Daemon fixture**: shared subordinate Emacs cached in a `defvar` across `:daemon` tests; per-test isolation via `emacsclient --eval`-driven reset; `:fresh-daemon` tests opt out for clean `-Q` spawns.
@@ -211,12 +208,11 @@ CI: Emacs 30.1. `make all` + `make test-mcp` on every push. Build fails on any b
 ## Reuse, don't reinvent
 
 - `jsonrpc.el` abstract `jsonrpc-connection` class — keep dispatch/continuation; replace framing only.
-- `x-export-frames` (built in) — primary screenshot path.
+- `x-export-frames` (built in) — the screenshot path.
 - `where-is-internal`, `lookup-key`, `key-binding`, `execute-kbd-macro` — keybinding tools.
 - `profiler-start` / `profiler-report-cpu` — startup profile (always under `unwind-protect`).
-- `transient` — menus.
 - `propcheck` — test-only property generation.
-- `xvfb-run`, `socat`, `grim` — nixpkgs.
+- `xvfb-run` (for `make test-gui`), `socat` (for the relay), `jq` (for token injection in the relay) — nixpkgs.
 
 ## Security
 
