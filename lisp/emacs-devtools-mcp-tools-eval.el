@@ -38,7 +38,6 @@
 (require 'jsonrpc)
 (require 'edebug)
 (require 'find-func)
-(require 'backtrace)
 (require 'trace)
 (require 'emacs-devtools-mcp)
 (require 'emacs-devtools-mcp-rpc)
@@ -216,45 +215,118 @@ pre-dated this session."
 
 ;;;; capture-backtrace.
 
+(defvar edmcp--capture-bt-frames nil
+  "Dynamic accumulator for `capture-backtrace': frames newest-first.
+Bound by `emacs-devtools-mcp-tools-eval--capture-backtrace' for
+the duration of one capture; the named hook + walker push onto
+this list at signal time.")
+
+(defvar edmcp--capture-bt-stopped nil
+  "Dynamic flag: t once `capture-backtrace' walks past its marker.
+Once set, the walker stops collecting -- everything older than
+the marker is MCP dispatch plumbing.")
+
+(defvar edmcp--capture-bt-armed nil
+  "Dynamic flag: t while `capture-backtrace' should record one signal.
+Flipped off on first signal so a signal raised inside the walker
+itself cannot re-enter and loop.")
+
+(defconst edmcp--capture-bt-plumbing
+  '(mapbacktrace
+    edmcp--capture-bt-signal-hook
+    edmcp--capture-bt-walk
+    edmcp--capture-backtrace-eval
+    emacs-devtools-mcp-tools-eval--capture-backtrace
+    edmcp--tools-capture-backtrace)
+  "Frames belonging to `capture-backtrace's own machinery.
+The walker drops any frame whose `fun' is `eq' to one of these
+so the returned backtrace contains only user-visible frames.")
+
+(defun edmcp--capture-backtrace-eval (form)
+  "Evaluate FORM; named purely so `capture-backtrace' can trim plumbing.
+The signal-hook walker stops as soon as it sees this function on
+the stack, so MCP dispatch frames (jsonrpc, `condition-case', the
+deftool wrappers) never leak into the returned backtrace.  Do not
+rename without updating `edmcp--capture-bt-plumbing' and the
+`eq' check in `edmcp--capture-bt-walk'."
+  (eval form t))
+
+(defun edmcp--capture-backtrace-format-frame (frame)
+  "Format FRAME -- a (EVALD FUN ARGS FLAGS) tuple from `mapbacktrace'."
+  (let ((fun (nth 1 frame))
+        (args (nth 2 frame)))
+    (cond
+     ((eq args :nargs) (format "%s" fun))
+     ((null args) (format "(%s)" fun))
+     (t (format "(%s %s)" fun
+                (mapconcat #'prin1-to-string args " "))))))
+
+(defun edmcp--capture-bt-walk (evald fun args flags)
+  "`mapbacktrace' callback for `capture-backtrace'.
+EVALD, FUN, ARGS, and FLAGS are the standard frame quad supplied
+by `mapbacktrace'.  Drops frames in `edmcp--capture-bt-plumbing'
+and frames whose FUN is not a symbol (anonymous closures from
+the signal-hook binding); collects everything else into
+`edmcp--capture-bt-frames' until the marker frame is reached, at
+which point `edmcp--capture-bt-stopped' is set and further frames
+are ignored."
+  (unless edmcp--capture-bt-stopped
+    (cond
+     ((eq fun 'edmcp--capture-backtrace-eval)
+      (setq edmcp--capture-bt-stopped t))
+     ((memq fun edmcp--capture-bt-plumbing) nil)
+     ;; Anonymous closures (typically the byte-compiled
+     ;; `signal-hook-function' itself when defined as a `lambda')
+     ;; render as opaque `#[...]' blobs and carry no useful
+     ;; information for the agent; drop them.
+     ((not (symbolp fun)) nil)
+     (t (push (list evald fun args flags) edmcp--capture-bt-frames)))))
+
+(defun edmcp--capture-bt-signal-hook (_signal _data)
+  "`signal-hook-function' for `capture-backtrace'.
+Invoked at signal time, before unwinding.  Walks the live stack
+via `mapbacktrace' once per capture; the armed flag prevents
+re-entry from a signal raised inside the walker itself."
+  (when edmcp--capture-bt-armed
+    (setq edmcp--capture-bt-armed nil)
+    (mapbacktrace #'edmcp--capture-bt-walk)))
+
 (defun emacs-devtools-mcp-tools-eval--capture-backtrace (form pl plen)
   "Evaluate FORM; on error or quit, return the captured backtrace.
 PL and PLEN bound `print-level' and `print-length' for the
-returned `:value'.  When FORM signals, `signal-hook-function' is
-used to record the live frame stack via `backtrace' BEFORE
-unwinding -- so the trace reflects the point of failure, not the
-point where `condition-case' caught.  This avoids the
-`debug-on-error' / `debug-on-signal' machinery, which is
-process-global and has surprising interactions with ERT's batch
-runner.
+returned `:value'.  When FORM signals,
+`edmcp--capture-bt-signal-hook' walks the live frame stack via
+`mapbacktrace' BEFORE unwinding -- so the trace reflects the
+point of failure, not the point where `condition-case' caught.
+This avoids the `debug-on-error' / `debug-on-signal' machinery,
+which is process-global and has surprising interactions with
+ERT's batch runner.
+
+Frames belonging to the MCP dispatch path (jsonrpc, the deftool
+wrapper, this file's own helpers, the named signal hook and
+walker) are trimmed: collection stops the moment
+`edmcp--capture-backtrace-eval' appears on the stack, and
+plumbing names listed in `edmcp--capture-bt-plumbing' are
+dropped along the way -- so only frames between FORM and the
+signaling call appear in `:backtrace'.
 
 Returns a plist with `:value' or `:error', `:backtrace' (string,
 empty when none), and `:messages' (the *Messages* delta,
 redacted)."
-  (require 'backtrace)
   (let* ((messages-buf (get-buffer "*Messages*"))
          (msg-start (and messages-buf
                          (with-current-buffer messages-buf (point-max))))
-         (bt-text "")
-         (recording t)
+         (edmcp--capture-bt-frames nil)
+         (edmcp--capture-bt-stopped nil)
+         (edmcp--capture-bt-armed t)
          (result nil)
          (err nil))
-    (let ((signal-hook-function
-           (lambda (_signal _data)
-             ;; `signal-hook-function' is invoked at signal time,
-             ;; before unwinding, in the signaling frame.  Record the
-             ;; backtrace here so it reflects the point of failure.
-             ;; Flip the recording flag off FIRST so any signal raised
-             ;; by `with-output-to-string' or `backtrace' itself
-             ;; doesn't re-enter (which would loop forever via this
-             ;; hook).
-             (when recording
-               (setq recording nil)
-               (setq bt-text
-                     (with-output-to-string (backtrace)))))))
+    (let ((signal-hook-function #'edmcp--capture-bt-signal-hook))
       (condition-case oops
           (let ((print-level pl)
                 (print-length plen))
-            (setq result (prin1-to-string (eval form t))))
+            (setq result
+                  (prin1-to-string (edmcp--capture-backtrace-eval form))))
         ((error quit)
          (setq err (error-message-string oops)))))
     (let* ((delta (and messages-buf msg-start
@@ -262,17 +334,25 @@ redacted)."
                          (buffer-substring-no-properties
                           msg-start (point-max)))))
            (redacted (emacs-devtools-mcp-redact (or delta "")))
+           (bt-text
+            (if edmcp--capture-bt-frames
+                (mapconcat #'edmcp--capture-backtrace-format-frame
+                           ;; `push' built the list outermost-first;
+                           ;; flip it so the innermost (signaling)
+                           ;; frame appears at the top, matching the
+                           ;; convention of `(backtrace)'.
+                           (nreverse edmcp--capture-bt-frames) "\n")
+              ""))
            ;; Tail-truncate the backtrace before redaction so the cap
-           ;; preserves the signaling frames at the bottom rather than
-           ;; the older ones at the top.
+           ;; preserves the signaling frames at the top rather than
+           ;; the older ones near the bottom.
            (bt-cap emacs-devtools-mcp-backtrace-max-bytes)
            (bt-bytes (string-bytes bt-text))
            (bt-trimmed
             (if (and bt-cap (> bt-bytes bt-cap))
-                (concat (format "[truncated %d bytes from head]\n"
-                                (- bt-bytes bt-cap))
-                        (substring bt-text (max 0 (- (length bt-text)
-                                                     bt-cap))))
+                (concat (substring bt-text 0 (min (length bt-text) bt-cap))
+                        (format "\n[truncated %d bytes from tail]"
+                                (- bt-bytes bt-cap)))
               bt-text))
            (bt-redacted (emacs-devtools-mcp-redact bt-trimmed)))
       (if err
@@ -429,6 +509,9 @@ are preserved so paginated reassembly yields identical text."
 
 (emacs-devtools-mcp-deftool eval-elisp
     "Evaluate FORM in TARGET and return its printed value.
+FORM is parsed as a single Lisp sexp -- exactly one top-level
+expression is read; trailing forms after the first are ignored.
+Wrap multi-form input in `(progn ...)' to evaluate every form.
 Captures the *Messages* delta and any error.  Output is redacted:
 lines whose first non-whitespace token starts with `auth-source-',
 `epg-', or `tramp-' (modulo a leading open paren) are dropped
@@ -475,10 +558,13 @@ The original `symbol-function' value is recorded so
 
 (emacs-devtools-mcp-deftool capture-backtrace
     "Evaluate FORM and return any signaled backtrace.
-`signal-hook-function' is used to record the live frame stack via
-`backtrace' at signal time, so the trace reflects the point of
-failure, not the point where the package's `condition-case'
-caught.  Output is tail-truncated at
+FORM is parsed as a single Lisp sexp -- wrap in `(progn ...)' to
+exercise multiple top-level forms.  `signal-hook-function' is used
+to record the live frame stack at signal time, so the trace
+reflects the point of failure, not the point where the package's
+`condition-case' caught.  Frames belonging to the MCP server's
+own dispatch path are trimmed; only frames between FORM and the
+signaling call appear.  Output is tail-truncated at
 `emacs-devtools-mcp-backtrace-max-bytes' and redacted."
   :cost :slow
   :read-only nil

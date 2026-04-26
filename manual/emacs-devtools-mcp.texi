@@ -282,8 +282,18 @@ idempotent: killing an unknown handle returns OK rather than signalling.
 
 @deffn Tool eval_elisp &key form print_level print_length target
 Evaluate @code{form} in @code{target} and return its printed value, the
-@samp{*Messages*} delta, and any error.  Output is redacted to drop lines
-mentioning auth-source / epg / tramp before transit.  Destructive.
+@samp{*Messages*} delta, and any error.  @code{form} is parsed as a
+single Lisp sexp -- exactly one top-level expression is read; trailing
+forms are ignored, so wrap multi-form input in @code{(progn @dots{})}.
+
+Output is passed through the redaction layer before it leaves the host:
+lines whose first significant token (modulo leading whitespace and one
+optional open paren) starts with @code{auth-source-}, @code{epg-}, or
+@code{tramp-} are dropped from the @samp{*Messages*} capture.  A line
+that merely mentions one of those prefixes mid-token -- e.g.@: a
+frame named @code{my-pkg-call-auth-source-foo} -- passes through.  The
+default set is non-disableable by design; add project-specific patterns
+via @code{emacs-devtools-mcp-redact-extra-regexps}.  Destructive.
 
 Example:
 
@@ -600,10 +610,13 @@ files are additionally rejected up-front if they contain @code{#.} or
 @code{file-truename} + prefix match against
 @code{emacs-devtools-mcp-init-allowlist}.
 @item
-@strong{Output redaction}.  A regex layer scrubs lines mentioning
-@code{auth-source-}, @code{epg-}, and @code{tramp-} (plus
-@code{redact-extra-regexps}) from any @samp{*Messages*} / backtrace /
-profiler-frame surface before it leaves the host.
+@strong{Output redaction}.  A regex layer scrubs lines whose first
+significant token (modulo leading whitespace and one optional open
+paren) starts with @code{auth-source-}, @code{epg-}, or @code{tramp-}
+(plus @code{redact-extra-regexps}) from any @samp{*Messages*} /
+backtrace / profiler-frame surface before it leaves the host.  Lines
+that merely mention those prefixes mid-token are not redacted; the
+match is anchored to the line start, not a substring search.
 @item
 @strong{Resource caps}.  @code{with-timeout} on every @code{:slow}
 handler; @code{max-response-bytes}; @code{screenshot-max-pixels};

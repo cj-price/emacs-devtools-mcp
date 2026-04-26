@@ -63,15 +63,17 @@ Idempotent: a second call against an already-killed handle still
 returns ok rather than signaling, matching the
 `idempotentHint' annotation.
 
-The result distinguishes three terminal states via `:status':
-  \"unknown_handle\" -- handle was never registered (or already dropped),
+The result distinguishes four terminal states via `:status':
+  \"unknown_handle\" -- handle is not in the registry (never spawned,
+                       already dropped by an earlier kill, or simply a typo),
   \"killed\"         -- `(kill-emacs)' RPC succeeded,
   \"already_dead\"   -- handle was registered but its daemon did not answer,
   \"attached\"       -- handle was attached; the user-owned daemon
                        is left running and the record is dropped.
-`already_gone' is preserved as a boolean for backwards compatibility:
-true for `unknown_handle' and `already_dead', false for `killed' and
-`attached'."
+`already_gone' is true only for `already_dead' -- a registered handle
+whose process is gone.  An `unknown_handle' returns
+`already_gone' = false so callers can distinguish a typo or stale
+handle string from a registered handle whose daemon happens to be dead."
   (let* ((handle (plist-get params :handle))
          (rec (gethash handle emacs-devtools-mcp-spawn--handles))
          (status
@@ -83,7 +85,7 @@ true for `unknown_handle' and `already_dead', false for `killed' and
                 ('killed "killed")
                 ('already-dead "already_dead")
                 ('attached "attached"))))))
-         (already-gone (member status '("unknown_handle" "already_dead"))))
+         (already-gone (string= status "already_dead")))
     (list :ok t
           :handle handle
           :status status

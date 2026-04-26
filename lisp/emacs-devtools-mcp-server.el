@@ -84,12 +84,23 @@ A record carries: :name, :doc, :cost, :read-only, :destructive,
 post-`:slow'-wrapping function ready to call on validated params.")
 
 (defconst emacs-devtools-mcp-target-schema
-  '(:oneOf [(:type "object"
+  '(:description
+    "Where to run the tool.  Always an object, never a bare string.
+`{\"host\": true}' (the default when omitted) routes to the user's
+running Emacs -- whichever PID hosts this MCP server.  `{\"spawn\":
+\"<HANDLE>\"}' routes to a subordinate Emacs previously created by
+`spawn_emacs' or registered by `attach_emacs'; the handle is the
+opaque string returned in those tools' results.  No other shapes
+are accepted -- a string, a `{\"spawn\": true}', or a
+`{\"server_name\": ...}' all fail schema validation."
+    :oneOf [(:type "object"
              :properties ((host . (:const t)))
-             :required ["host"])
+             :required ["host"]
+             :description "Run on the user's Emacs (the MCP server host).")
             (:type "object"
              :properties ((spawn . (:type "string")))
-             :required ["spawn"])])
+             :required ["spawn"]
+             :description "Run on the spawn handle returned by `spawn_emacs'/`attach_emacs'.")])
   "JSON Schema fragment shared by every tool's `target' parameter.
 Splice it into a tool's :properties via the symbol -- the
 schema validator handles vector arrays uniformly via
@@ -385,9 +396,22 @@ and avoids any predictability surprise from `random'."
 ITEMS is the full list when CURSOR is nil; otherwise the cursor's
 saved tail is used and ITEMS is ignored.  PAGE-SIZE is a positive
 integer.  When more entries remain after the page, a fresh cursor
-is allocated for the tail and returned in the second slot."
+is allocated for the tail and returned in the second slot.
+
+A non-nil CURSOR that misses the cursor store -- because it was
+never issued, has been consumed by an earlier call, or has aged
+out past `emacs-devtools-mcp-cursor-ttl-seconds' -- signals a
+JSON-RPC `-32602' error rather than silently returning an empty
+page.  An empty page would be indistinguishable from end-of-results
+and would leave the caller convinced their iteration completed."
   (let* ((tail (if cursor
-                   (emacs-devtools-mcp--cursor-fetch cursor)
+                   (or (emacs-devtools-mcp--cursor-fetch cursor)
+                       (jsonrpc-error
+                        :code -32602
+                        :message
+                        (format "Invalid or expired cursor: %S (cursors expire after %d s)"
+                                cursor
+                                emacs-devtools-mcp-cursor-ttl-seconds)))
                  items))
          (page (cl-subseq tail 0 (min page-size (length tail))))
          (rest (nthcdr (length page) tail))

@@ -89,25 +89,34 @@ explicitly matches them."
                         :json-false)))))
 
 (defun emacs-devtools-mcp-tools-buffer--substring
-    (name start end with-properties max-bytes)
-  "Return part of buffer NAME between START and END.
-WITH-PROPERTIES non-nil keeps text properties as a structured
-list; nil yields a plain string.  Output is capped to MAX-BYTES;
-result plist carries :text and, when truncated, :truncated t
-plus :next_offset."
+    (name start end max-bytes)
+  "Return part of buffer NAME between START and END as a plain string.
+Text properties are dropped: the wire is JSON, which has no place
+to carry them, so claiming to keep them would be a lie.  Output
+is capped to MAX-BYTES; result plist carries :text and, when
+truncated, :truncated t plus :next_offset.  When START or END
+fall outside the buffer they are clamped, but raw inputs that
+form an inverted range (start > end) signal before clamping --
+otherwise the resulting error would mention silently-rewritten
+bounds."
   (let ((b (get-buffer name)))
     (unless b
       (error "Buffer not found: %s" name))
     (with-current-buffer b
       (let* ((pmin (point-min))
-             (pmax (point-max))
-             (s0 (max pmin (or start pmin)))
-             (e0 (min pmax (or end pmax))))
-        (when (> s0 e0)
-          (error "Invalid range: start %d > end %d" s0 e0))
-        (let* ((raw (if with-properties
-                        (buffer-substring s0 e0)
-                      (buffer-substring-no-properties s0 e0)))
+             (pmax (point-max)))
+        (when (and (integerp start) (integerp end) (> start end))
+          (error "Invalid range: start %d > end %d (buffer span %d..%d)"
+                 start end pmin pmax))
+        (let* ((s0 (max pmin (or start pmin)))
+               (e0 (min pmax (or end pmax))))
+          (when (> s0 e0)
+            (error
+             "Invalid range: start %s > end %s (buffer span %d..%d)"
+             (if start (number-to-string start) "nil")
+             (if end (number-to-string end) "nil")
+             pmin pmax))
+        (let* ((raw (buffer-substring-no-properties s0 e0))
                (bytes (string-bytes raw))
                (truncated (> bytes max-bytes)))
           (if (not truncated)
@@ -129,7 +138,7 @@ plus :next_offset."
                           i (1+ i)))))
               (list :text (concat (nreverse acc))
                     :truncated t
-                    :next_offset next-offset))))))))
+                    :next_offset next-offset)))))))))
 
 (defun emacs-devtools-mcp-tools-buffer--messages-tail (n)
   "Return the last N lines of the *Messages* buffer, redacted.
@@ -163,28 +172,101 @@ returning `[]' for `n=0' would mask a bug in the caller."
                (paras (split-string all "\n\n" t "[ \t\n]+")))
           paras)))))
 
+(defun edmcp--ert-parse-selector (selector)
+  "Parse SELECTOR (a string or nil/t) into an ERT selector value.
+Nil and the literal string \"t\" map to t (all loaded tests).  An
+empty string is treated as nil so missing-vs-empty is not a
+correctness pitfall.  Anything else is read with the Lisp reader
+after rejecting `#.'/`#@' reader-macro escapes -- so the full ERT
+selector grammar is available (`(tag :fast)', `(member t1 t2)',
+`(or A B)', `(satisfies PRED)', etc.) without exposing reader-time
+code execution.  A bare regexp must be wired through the reader as
+a quoted string -- `\"^foo$\"' on the wire reads to the string
+literal that ERT then matches against test names."
+  (cond
+   ((null selector) t)
+   ((eq selector t) t)
+   ((stringp selector)
+    (cond
+     ((string-empty-p selector) t)
+     ((string= selector "t") t)
+     ((string-match-p "#[.@]" selector)
+      (error
+       "Invalid ert selector: refuses `#.' / `#@' reader macros (got %S)"
+       selector))
+     (t
+      (condition-case err
+          (let ((parsed (read-from-string selector)))
+            (unless (and (consp parsed)
+                         (= (cdr parsed) (length selector)))
+              ;; Trailing junk after the first sexp would be silently
+              ;; discarded by `read-from-string'; fail loudly so the
+              ;; caller sees that, e.g., `"foo bar"' did not match a
+              ;; valid grammar.
+              (error "Trailing characters after %S in selector %S"
+                     (car parsed) selector))
+            (car parsed))
+        (error
+         (error "Invalid ert selector %S: %s"
+                selector (error-message-string err)))))))
+   (t selector)))
+
+(defun edmcp--ert-collect-failures (stats)
+  "Build a vector of (:name :message) plists, one per failure in STATS.
+\"Failure\" is the union of `ert-test-failed-p' and the quit/abort
+result types -- anything ERT classifies as not-passed-not-skipped.
+Skipped runs are reported separately via the `:skipped' counter
+and do not appear in the returned vector."
+  (let (failures)
+    (mapc
+     (lambda (test)
+       (let ((result (ert-test-most-recent-result test)))
+         (when (and result
+                    (not (ert-test-passed-p result))
+                    (not (ert-test-skipped-p result)))
+           (let ((message
+                  (cond
+                   ((and (ert-test-result-with-condition-p result)
+                         (ert-test-result-with-condition-condition result))
+                    (let ((cond
+                           (ert-test-result-with-condition-condition result)))
+                      (condition-case nil
+                          (error-message-string cond)
+                        (error (format "%S" cond)))))
+                   (t (format "%s" (type-of result))))))
+             (push (list :name (symbol-name (ert-test-name test))
+                         :message
+                         (or (emacs-devtools-mcp-redact message) ""))
+                   failures)))))
+     (append (ert--stats-tests stats) nil))
+    (vconcat (nreverse failures))))
+
 (defun emacs-devtools-mcp-tools-buffer--ert-run (selector)
-  "Run ERT for SELECTOR (string or t) and return a plist summary.
-SELECTOR strings are resolved via `intern-soft' so callers can
-only reach existing tests; the literal \"t\" runs every loaded
-test (use it sparingly -- the slow-tool timeout still applies)."
-  (let* ((sel (cond
-               ((null selector) t)
-               ((and (stringp selector) (string= selector "t")) t)
-               ((stringp selector)
-                (or (intern-soft selector)
-                    (error "Unknown ert selector: %s" selector)))
-               (t selector)))
+  "Run ERT for SELECTOR and return a plist summary.
+SELECTOR is parsed by `edmcp--ert-parse-selector' -- see that
+function for the accepted grammar.  Use the literal \"t\" or
+nil/omission to run every loaded test (the slow-tool timeout
+still applies).  The result plist carries:
+  :total    -- number of tests selected,
+  :passed   -- count of expected-pass results,
+  :failed   -- count of unexpected (failed) results,
+  :skipped  -- count of skipped tests,
+  :ok       -- t if `:failed' is zero, else `:json-false',
+  :failures -- vector of `(:name :message)' plists, one per
+               failed test, redacted; empty when `:failed' is 0."
+  (let* ((sel (edmcp--ert-parse-selector selector))
          (stats (ert-run-tests sel (lambda (&rest _)) nil))
          (passed (ert-stats-completed-expected stats))
          (failed (ert-stats-completed-unexpected stats))
          (skipped (ert-stats-skipped stats))
-         (total (ert-stats-total stats)))
+         (total (ert-stats-total stats))
+         (failures (edmcp--ert-collect-failures stats)))
     (list :total total
           :passed passed
           :failed failed
           :skipped skipped
-          :ok (if (zerop failed) t :json-false))))
+          :ok (if (zerop failed) t :json-false)
+          :failures failures)))
 
 (defun emacs-devtools-mcp-tools-buffer--describe-hooks (hook)
   "Describe HOOK or, when HOOK is nil, list every bound hook symbol.
@@ -251,14 +333,13 @@ is a list.  Returns a JSON-shaped plist in either branch:
   (let* ((name (plist-get params :buffer))
          (start (plist-get params :start))
          (end (plist-get params :end))
-         (with-props (eq (plist-get params :with_properties) t))
          (max-bytes (or (plist-get params :max_bytes)
                         emacs-devtools-mcp-buffer-substring-default-max-bytes))
          (target (plist-get params :target)))
     (emacs-devtools-mcp-spawn-call
      target
      `(emacs-devtools-mcp-tools-buffer--substring
-       ,name ,start ,end ,with-props ,max-bytes))))
+       ,name ,start ,end ,max-bytes))))
 
 (defun edmcp--tools-list-messages (params)
   "Handler for `list-messages'.  PARAMS is the validated request plist."
@@ -334,8 +415,10 @@ is a list.  Returns a JSON-shaped plist in either branch:
   :handler #'edmcp--tools-buffer-state)
 
 (emacs-devtools-mcp-deftool buffer-substring
-    "Return up to MAX_BYTES of BUFFER between START and END.
-Sets `truncated: true' + `next_offset' when the cap is hit."
+    "Return up to MAX_BYTES of BUFFER between START and END as plain text.
+Sets `truncated: true' + `next_offset' when the cap is hit.  Text
+properties are not returned -- the JSON wire has no place to
+carry them, so the result is always a plain string."
   :cost :fast
   :read-only t
   :idempotent t
@@ -343,7 +426,6 @@ Sets `truncated: true' + `next_offset' when the cap is hit."
             :properties ((buffer          . (:type "string"))
                          (start           . (:type ["integer" "null"]))
                          (end             . (:type ["integer" "null"]))
-                         (with_properties . (:type ["boolean" "null"]))
                          (max_bytes       . (:type ["integer" "null"]))
                          (target          . ,emacs-devtools-mcp-target-schema))
             :required ["buffer"])
@@ -371,7 +453,22 @@ Sets `truncated: true' + `next_offset' when the cap is hit."
   :handler #'edmcp--tools-list-warnings)
 
 (emacs-devtools-mcp-deftool ert-run
-    "Run ERT for SELECTOR (default: all tests) and return a summary plist."
+    "Run ERT for SELECTOR (default: all tests) and return a summary plist.
+SELECTOR is parsed by the Lisp reader after rejecting `#.'/`#@'
+reader-macro escapes, so the full ERT selector grammar is
+available:
+  - nil or \"t\"           run every loaded test;
+  - \"my-test-name\"       run that single test (must be loaded);
+  - \"\\\"^foo-\\\"\"      regexp -- a quoted string matches names;
+  - \"(tag :fast)\"        all tests carrying the `:fast' tag;
+  - \"(member t1 t2)\"     a hand-picked set;
+  - \"(or A B)\", \"(and A B)\", \"(not A)\", \"(satisfies PRED)\"
+                          combine the above.
+
+The result plist carries `:total', `:passed', `:failed',
+`:skipped', `:ok', and `:failures' -- a vector of `(:name
+:message)' plists with the error-message-string of each
+failed test, redacted via the standard layer."
   :cost :slow
   :read-only nil
   :destructive t

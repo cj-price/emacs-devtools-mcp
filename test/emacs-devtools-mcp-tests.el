@@ -1891,8 +1891,12 @@ kill -- so the field is removed from the public schema."
                            :arguments (list :handle "h"))))
               (text (plist-get (aref (plist-get env2 :content) 0) :text)))
          (should-not (eq t (plist-get env2 :isError)))
-         (should (string-match-p "already_gone" text))
-         (should (string-match-p "true" text)))))))
+         ;; Second call sees a handle that was dropped by the first --
+         ;; reported as `unknown_handle' with `already_gone: false', so
+         ;; callers can distinguish a typo from a registered-but-dead
+         ;; daemon.
+         (should (string-match-p "\"status\":[ ]*\"unknown_handle\"" text))
+         (should (string-match-p "\"already_gone\":[ ]*false" text)))))))
 
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-tool-schema-rejects-bad-args ()
@@ -2184,9 +2188,12 @@ single-arm regression doesn't pass the existing tests."
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-tool-kill-unknown-handle-ok ()
   "Calling `kill-emacs' with an unknown handle returns a success envelope.
-The tool is annotated `idempotentHint: true', so a second call --
-or a call against a never-registered handle -- must return ok
-with `:already_gone t', not an `:isError' envelope."
+The tool is annotated `idempotentHint: true', so a call against a
+never-registered handle must return ok rather than an `:isError'
+envelope.  The `:status' is `\"unknown_handle\"' and `:already_gone'
+is false -- the handle is gone in the sense of \"not in the
+registry\", but it is distinguishable from `\"already_dead\"' (a
+registered handle whose daemon stopped answering)."
   :tags '(:fast)
   (emacs-devtools-mcp-tests--with-empty-handles
    (let* ((env (edmcp--server-tools-call
@@ -2195,8 +2202,8 @@ with `:already_gone t', not an `:isError' envelope."
                       :arguments (list :handle "ghost"))))
           (text (plist-get (aref (plist-get env :content) 0) :text)))
      (should-not (eq t (plist-get env :isError)))
-     (should (string-match-p "already_gone" text))
-     (should (string-match-p "true" text)))))
+     (should (string-match-p "\"status\":[ ]*\"unknown_handle\"" text))
+     (should (string-match-p "\"already_gone\":[ ]*false" text)))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-kill-attached-spares-daemon ()
   "Killing an attached handle drops the record without sending `kill-emacs'.
@@ -2346,17 +2353,19 @@ connect error.  The server name is the daemon's identity; refuse."
 Three terminal states must be observable: `unknown_handle' (we
 never knew about it), `killed' (RPC succeeded), `already_dead'
 (handle was registered but its daemon did not answer).  The
-older `already_gone' boolean stays for backwards compatibility."
+older `already_gone' boolean stays for backwards compatibility,
+true only for `already_dead' so an unknown handle is
+distinguishable from a registered-but-dead one."
   :tags '(:fast)
   (emacs-devtools-mcp-tests--with-empty-handles
-   ;; Unknown handle -- we never knew about it.
+   ;; Unknown handle -- never registered, so `already_gone' is false.
    (let* ((env (edmcp--server-tools-call
                 nil
                 (list :name "kill_emacs"
                       :arguments (list :handle "never-existed"))))
           (text (plist-get (aref (plist-get env :content) 0) :text)))
      (should (string-match-p "\"status\":[ ]*\"unknown_handle\"" text))
-     (should (string-match-p "\"already_gone\":[ ]*true" text)))
+     (should (string-match-p "\"already_gone\":[ ]*false" text)))
    ;; Registered, RPC succeeds -> killed.
    (let ((now (float-time)))
      (cl-letf (((symbol-function 'edmcp--spawn-call-process)
@@ -2961,23 +2970,44 @@ This is the documented idempotent contract on the wire."
     (fmakunbound 'edmcp-tests--never-traced)))
 
 (ert-deftest emacs-devtools-mcp-tests/capture-backtrace-truncates-large ()
-  "Oversized backtraces are tail-truncated rather than dropped entirely.
-The signaling frames at the bottom of the stack are the useful
-ones; we keep those and prefix a `[truncated N bytes from head]'
-marker.  Sets the cap below the empirical size of even the
-shortest captured backtrace to force truncation regardless of how
-many frames the runtime records."
+  "Oversized backtraces are head-truncated rather than dropped entirely.
+The signaling frames at the top of the stack are the useful ones;
+we keep those and append a `[truncated N bytes from tail]' marker.
+Sets the cap below the empirical size of even the shortest
+captured backtrace to force truncation regardless of how many
+frames the runtime records."
   :tags '(:fast)
-  (let ((emacs-devtools-mcp-backtrace-max-bytes 32))
+  (let ((emacs-devtools-mcp-backtrace-max-bytes 8))
     (let ((res (emacs-devtools-mcp-tools-eval--capture-backtrace
                 '(error "boom-from-cap-test") 6 100)))
       (should (string-match-p "boom-from-cap-test"
                               (plist-get res :error)))
       (let ((bt (plist-get res :backtrace)))
         (should (stringp bt))
-        (should (string-match-p "\\[truncated [0-9]+ bytes from head\\]" bt))
-        ;; Capped near the configured limit (allow prefix marker overhead).
+        (should (string-match-p "\\[truncated [0-9]+ bytes from tail\\]" bt))
+        ;; Capped near the configured limit (allow trailing marker overhead).
         (should (< (length bt) 256))))))
+
+(ert-deftest emacs-devtools-mcp-tests/capture-backtrace-trims-mcp-plumbing ()
+  "Captured backtrace stops at the marker; no MCP dispatch frames leak.
+The walker keys off `edmcp--capture-backtrace-eval' and stops the
+moment it sees that frame, so nothing older -- `condition-case'
+wrappers, jsonrpc, deftool, the server's tools-call dispatcher --
+appears in the returned text.  This regression test asserts the
+trimming directly: it calls `capture-backtrace' with a deeply nested
+form and confirms the marker function name and known plumbing
+prefixes are absent from `:backtrace'."
+  :tags '(:fast)
+  (let* ((res (emacs-devtools-mcp-tools-eval--capture-backtrace
+               '(let nil (error "boom-trim-test")) 6 100))
+         (bt (plist-get res :backtrace)))
+    (should (stringp bt))
+    (should (> (length bt) 0))
+    (should-not (string-match-p "edmcp--capture-backtrace-eval" bt))
+    (should-not (string-match-p "edmcp--server-tools-call" bt))
+    (should-not (string-match-p "jsonrpc" bt))
+    ;; The signaling frame is at the top.
+    (should (string-match-p "\\`(error " bt))))
 
 ;;;; ___Buffer tools___
 
@@ -3091,18 +3121,39 @@ many frames the runtime records."
      (edmcp--tools-buffer-substring
       '(:buffer "edmcp-substring-bad-range" :start 5 :end 2)))))
 
-(ert-deftest emacs-devtools-mcp-tests/buffer-substring-with-properties-preserves-faces ()
-  "When `with_properties' is t the returned text carries text properties."
+(ert-deftest emacs-devtools-mcp-tests/buffer-substring-error-reports-raw-bounds ()
+  "Range errors carry the raw client inputs, not silently-clamped values.
+Pre-fix, an out-of-range start was clamped to `point-max' before
+the inversion check fired, so a request like start=10000, end=9
+on a small buffer reported `start NNN > end 9' where NNN was
+the buffer's clamped point-max -- confusing for the agent who
+sent 10000."
+  :tags '(:fast)
+  (with-temp-buffer
+    (rename-buffer "edmcp-substring-raw-bounds" t)
+    (insert "abcdef")
+    (let ((err (should-error
+                (edmcp--tools-buffer-substring
+                 '(:buffer "edmcp-substring-raw-bounds"
+                   :start 10000 :end 9)))))
+      (should (string-match-p "10000" (cadr err)))
+      (should (string-match-p "\\b9\\b" (cadr err))))))
+
+(ert-deftest emacs-devtools-mcp-tests/buffer-substring-drops-text-properties ()
+  "Returned text is a plain string regardless of source buffer properties.
+The JSON wire has no carrier for text properties, so claiming to
+preserve them would be a lie; we drop them server-side."
   :tags '(:fast)
   (with-temp-buffer
     (rename-buffer "edmcp-substring-props" t)
     (insert (propertize "hi" 'face 'bold))
     (let* ((res (edmcp--tools-buffer-substring
                  '(:buffer "edmcp-substring-props"
-                   :start 1 :end 3 :with_properties t)))
+                   :start 1 :end 3)))
            (text (plist-get res :text)))
-      (should (equal "hi" (substring-no-properties text)))
-      (should (eq 'bold (get-text-property 0 'face text))))))
+      (should (equal "hi" text))
+      (should-not (get-text-property 0 'face text)))))
+
 
 (ert-deftest emacs-devtools-mcp-tests/list-messages-returns-redacted-tail ()
   "Recent *Messages* entries surface, with redacted lines stripped."
@@ -3178,25 +3229,91 @@ had no signal that the call had been malformed."
       (unintern sym nil))))
 
 (ert-deftest emacs-devtools-mcp-tests/ert-run-reports-failure ()
-  "A failing test in the selector lands as `failed: 1' + `ok: :json-false'."
+  "A failing test produces `failed: 1', `ok: :json-false', and `:failures' detail.
+The `:failures' vector carries `(:name :message)' entries so the
+caller does not have to grep stderr to learn which test failed and
+why."
   :tags '(:fast)
   (let* ((name (format "edmcp-ert-fixture-fail-%d" (random 100000)))
          (sym (intern name)))
-    (eval `(ert-deftest ,sym () (should nil)) t)
+    (eval `(ert-deftest ,sym () (should (= 1 99))) t)
     (unwind-protect
-        (let ((res (edmcp--tools-ert-run `(:selector ,name))))
+        (let* ((res (edmcp--tools-ert-run `(:selector ,name)))
+               (failures (plist-get res :failures)))
           (should (= 1 (plist-get res :total)))
           (should (= 0 (plist-get res :passed)))
           (should (= 1 (plist-get res :failed)))
-          (should (eq :json-false (plist-get res :ok))))
+          (should (eq :json-false (plist-get res :ok)))
+          (should (vectorp failures))
+          (should (= 1 (length failures)))
+          (should (equal name (plist-get (aref failures 0) :name)))
+          (should (stringp (plist-get (aref failures 0) :message)))
+          (should (> (length (plist-get (aref failures 0) :message)) 0)))
       (unintern sym nil))))
 
 (ert-deftest emacs-devtools-mcp-tests/ert-run-rejects-unknown-selector ()
-  "Selectors that do not resolve to an interned symbol raise an error."
+  "Selectors that do not resolve to a known test raise an error.
+The reader successfully turns the string into a symbol, but
+`ert-select-tests' raises when no matching test exists."
   :tags '(:fast)
   (should-error
    (edmcp--tools-ert-run
     '(:selector "edmcp-no-such-ert-test-anywhere-42"))))
+
+(ert-deftest emacs-devtools-mcp-tests/ert-run-accepts-tag-selector ()
+  "A `(tag :tagname)' selector runs every loaded test with that tag.
+Regression: the previous handler `intern-soft'-ed the selector and
+rejected anything but a symbol, so callers could not run a tag set
+through `ert_run' even though ERT itself supports it."
+  :tags '(:fast)
+  (let* ((tag (intern (format "edmcp-tag-%d" (random 100000))))
+         (n1 (format "edmcp-ert-tagged-pass-%d" (random 100000)))
+         (n2 (format "edmcp-ert-tagged-pass-%d" (random 100000)))
+         (s1 (intern n1))
+         (s2 (intern n2)))
+    (eval `(ert-deftest ,s1 () :tags '(,tag) (should t)) t)
+    (eval `(ert-deftest ,s2 () :tags '(,tag) (should t)) t)
+    (unwind-protect
+        (let* ((sel (format "(tag %s)" tag))
+               (res (edmcp--tools-ert-run `(:selector ,sel))))
+          (should (= 2 (plist-get res :total)))
+          (should (= 2 (plist-get res :passed)))
+          (should (eq t (plist-get res :ok))))
+      (unintern s1 nil)
+      (unintern s2 nil))))
+
+(ert-deftest emacs-devtools-mcp-tests/ert-run-accepts-regexp-selector ()
+  "A double-quoted string selector is treated by ERT as a name regexp.
+The wire string is read with the Lisp reader, so `\"foo\"' parses
+to the Lisp string `foo' which `ert-select-tests' interprets as a
+regexp matched against test names."
+  :tags '(:fast)
+  (let* ((tag (format "edmcp-regex-%d" (random 100000)))
+         (n1 (format "%s-one" tag))
+         (n2 (format "%s-two" tag))
+         (n3 (format "edmcp-other-%d" (random 100000)))
+         (s1 (intern n1))
+         (s2 (intern n2))
+         (s3 (intern n3)))
+    (eval `(ert-deftest ,s1 () (should t)) t)
+    (eval `(ert-deftest ,s2 () (should t)) t)
+    (eval `(ert-deftest ,s3 () (should t)) t)
+    (unwind-protect
+        (let* ((sel (format "%S" (concat "\\`" (regexp-quote tag))))
+               (res (edmcp--tools-ert-run `(:selector ,sel))))
+          (should (= 2 (plist-get res :total)))
+          (should (= 2 (plist-get res :passed))))
+      (unintern s1 nil) (unintern s2 nil) (unintern s3 nil))))
+
+(ert-deftest emacs-devtools-mcp-tests/ert-run-rejects-trailing-junk ()
+  "Trailing characters after the first sexp cause a structured error.
+Otherwise `read-from-string' would silently discard the tail and
+the agent would be confused why `(or A B) garbage' selected only A."
+  :tags '(:fast)
+  (let ((err (should-error
+              (edmcp--tools-ert-run
+               '(:selector "(or foo bar) extra-junk")))))
+    (should (string-match-p "Trailing characters" (cadr err)))))
 
 (ert-deftest emacs-devtools-mcp-tests/describe-hooks-without-arg-lists-symbols ()
   "Bare `describe-hooks' returns a JSON-shaped plist, not a raw list.

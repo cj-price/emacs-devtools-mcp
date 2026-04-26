@@ -384,7 +384,9 @@ block, or signals when no working backend is available."
       (error "Screenshot backend unavailable: %s" backend))
     (when (> (* pw ph) cap)
       (error (concat "Frame too large: %dx%d = %d pixels exceeds area cap "
-                     "%d (= %dx%d; configure %s)")
+                     "%d (= %dx%d).  Raise the cap by setting %s to a "
+                     "(WIDTH . HEIGHT) cons -- e.g. (cons 3840 2160) for "
+                     "4K -- not a single integer.")
              pw ph (* pw ph)
              cap
              (car emacs-devtools-mcp-screenshot-max-pixels)
