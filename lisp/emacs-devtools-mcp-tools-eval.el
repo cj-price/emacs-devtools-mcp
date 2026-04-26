@@ -22,10 +22,13 @@
 ;;   `untrace-function'     -- detach traces from a function
 ;;   `trace-log'            -- read a trace buffer with cursor pagination
 ;;
-;; Output is run through `emacs-devtools-mcp-redact' so common
-;; secret-bearing prefixes (auth-source-, epg-, tramp-) never leave
-;; the host.  All tools accept the standard `target' parameter and
-;; route through `emacs-devtools-mcp-spawn-call'.
+;; Output is run through `emacs-devtools-mcp-redact' so lines whose
+;; first non-whitespace token (modulo a leading open paren) starts
+;; with `auth-source-', `epg-', or `tramp-' never leave the host.
+;; The match is anchored at line-start; mentions of those tokens
+;; mid-line are not redacted -- see `emacs-devtools-mcp-redact'.
+;; All tools accept the standard `target' parameter and route
+;; through `emacs-devtools-mcp-spawn-call'.
 
 ;;; Code:
 
@@ -426,8 +429,12 @@ are preserved so paginated reassembly yields identical text."
 
 (emacs-devtools-mcp-deftool eval-elisp
     "Evaluate FORM in TARGET and return its printed value.
-Captures the *Messages* delta and any error.  Output is redacted
-to drop lines mentioning auth-source/epg/tramp before transit."
+Captures the *Messages* delta and any error.  Output is redacted:
+lines whose first non-whitespace token starts with `auth-source-',
+`epg-', or `tramp-' (modulo a leading open paren) are dropped
+before transit.  A line that only mentions one of those tokens
+mid-content -- e.g.\\ `(message \"auth-source: x\")' -- is not
+redacted; see `emacs-devtools-mcp-redact' for the exact patterns."
   :cost :slow
   :read-only nil
   :destructive t

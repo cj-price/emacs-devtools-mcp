@@ -61,13 +61,33 @@ remain."
   "Handler for `kill-emacs'.  PARAMS is the validated request plist.
 Idempotent: a second call against an already-killed handle still
 returns ok rather than signaling, matching the
-`idempotentHint' annotation."
+`idempotentHint' annotation.
+
+The result distinguishes three terminal states via `:status':
+  \"unknown_handle\" -- handle was never registered (or already dropped),
+  \"killed\"         -- `(kill-emacs)' RPC succeeded,
+  \"already_dead\"   -- handle was registered but its daemon did not answer,
+  \"attached\"       -- handle was attached; the user-owned daemon
+                       is left running and the record is dropped.
+`already_gone' is preserved as a boolean for backwards compatibility:
+true for `unknown_handle' and `already_dead', false for `killed' and
+`attached'."
   (let* ((handle (plist-get params :handle))
-         (already-gone
-          (null (gethash handle emacs-devtools-mcp-spawn--handles))))
-    (unless already-gone
-      (emacs-devtools-mcp-spawn-kill handle))
-    (list :ok t :handle handle :already_gone (if already-gone t :json-false))))
+         (rec (gethash handle emacs-devtools-mcp-spawn--handles))
+         (status
+          (cond
+           ((null rec) "unknown_handle")
+           (t
+            (let ((dropped (emacs-devtools-mcp-spawn-kill handle)))
+              (pcase (plist-get dropped :kill-status)
+                ('killed "killed")
+                ('already-dead "already_dead")
+                ('attached "attached"))))))
+         (already-gone (member status '("unknown_handle" "already_dead"))))
+    (list :ok t
+          :handle handle
+          :status status
+          :already_gone (if already-gone t :json-false))))
 
 (defun edmcp--tools-spawn-list (params)
   "Handler for `list-handles'.  PARAMS is the validated request plist."

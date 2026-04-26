@@ -146,20 +146,33 @@ so per-repo fixtures load without editing the allowlist."
 Signal `user-error' otherwise.  Accepts when *either* the expanded
 form or the symlink-resolved truename matches a prefix, so a
 NixOS-style symlink from `~/.config/emacs/init.el' into
-`/nix/store' is allowed."
+`/nix/store' is allowed.
+
+Existence is only revealed for paths whose expanded form already
+matches an allowlist prefix.  An off-allowlist path always reports
+`outside allowlist' regardless of whether the file exists, so an
+authenticated agent cannot probe arbitrary filesystem locations
+for presence by reading which error is returned."
   (let* ((abs (expand-file-name path))
-         (real (and (file-exists-p abs) (file-truename abs))))
-    (unless real
-      (user-error "Init file does not exist: %s" path))
-    (let ((prefixes (edmcp--auth-allowlist-prefixes)))
-      (unless (or (cl-some (lambda (p) (string-prefix-p p abs)) prefixes)
-                  (cl-some (lambda (p) (string-prefix-p p real)) prefixes))
-        (user-error "Init path %s outside allowlist (%s)"
-                    real
-                    (if prefixes
-                        (mapconcat #'identity prefixes ", ")
-                      "<empty>"))))
-    real))
+         (prefixes (edmcp--auth-allowlist-prefixes))
+         (abs-ok (cl-some (lambda (p) (string-prefix-p p abs)) prefixes)))
+    (cond
+     (abs-ok
+      (unless (file-exists-p abs)
+        (user-error "Init file does not exist: %s" abs))
+      (file-truename abs))
+     (t
+      (let* ((real (and (file-exists-p abs) (file-truename abs)))
+             (real-ok (and real
+                           (cl-some (lambda (p) (string-prefix-p p real))
+                                    prefixes))))
+        (if real-ok
+            real
+          (user-error "Init path %s outside allowlist (%s)"
+                      abs
+                      (if prefixes
+                          (mapconcat #'identity prefixes ", ")
+                        "<empty>"))))))))
 
 (defun emacs-devtools-mcp-auth-log-failure (name reason)
   "Append one auth-failure line for connection NAME with REASON.

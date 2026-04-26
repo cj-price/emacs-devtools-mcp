@@ -133,7 +133,11 @@ plus :next_offset."
 
 (defun emacs-devtools-mcp-tools-buffer--messages-tail (n)
   "Return the last N lines of the *Messages* buffer, redacted.
-N defaults to `emacs-devtools-mcp-buffer-list-page-size' when nil."
+N defaults to `emacs-devtools-mcp-buffer-list-page-size' when nil.
+Non-positive N is rejected with a structured error -- silently
+returning `[]' for `n=0' would mask a bug in the caller."
+  (when (and n (<= n 0))
+    (error "n must be positive, got %d" n))
   (let ((buf (get-buffer "*Messages*"))
         (cap (or n emacs-devtools-mcp-buffer-list-page-size)))
     (if (not buf)

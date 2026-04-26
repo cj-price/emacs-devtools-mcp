@@ -237,14 +237,18 @@ package is loaded before any user `-l INIT' runs."
           (run-with-timer 60 60 #'edmcp--spawn-reaper-tick))))
 
 (defun edmcp--spawn-reaper-tick ()
-  "Kill every handle idle past `emacs-devtools-mcp-spawn-idle-timeout'."
+  "Kill every spawned handle idle past `emacs-devtools-mcp-spawn-idle-timeout'.
+Attached handles are skipped: the idle timeout is a resource cap on
+daemons this package started, not a license to reap daemons the user
+launched out-of-band."
   (let ((now (float-time))
         (dead nil))
     (maphash
      (lambda (h rec)
-       (let ((idle (- now (plist-get rec :last-used))))
-         (when (>= idle emacs-devtools-mcp-spawn-idle-timeout)
-           (push h dead))))
+       (unless (plist-get rec :attached)
+         (let ((idle (- now (plist-get rec :last-used))))
+           (when (>= idle emacs-devtools-mcp-spawn-idle-timeout)
+             (push h dead)))))
      emacs-devtools-mcp-spawn--handles)
     (dolist (h dead)
       (ignore-errors (emacs-devtools-mcp-spawn-kill h)))))
@@ -289,11 +293,32 @@ boot timeout."
       (edmcp--spawn-ensure-reaper)
       rec)))
 
+(defun edmcp--spawn-find-by-server-name (server-name)
+  "Return the existing handle string registered against SERVER-NAME, or nil.
+Walks `emacs-devtools-mcp-spawn--handles' once.  Used by
+`spawn-attach' to refuse a second registration of the same daemon
+-- two handles for one daemon let an explicit kill or reaper sweep
+on one strand the other against a now-dead server name."
+  (let ((found nil))
+    (maphash (lambda (h rec)
+               (when (and (null found)
+                          (equal server-name (plist-get rec :server-name)))
+                 (setq found h)))
+             emacs-devtools-mcp-spawn--handles)
+    found))
+
 (defun emacs-devtools-mcp-spawn-attach (server-name)
   "Register an externally-started daemon SERVER-NAME and return its record.
 The server name must match `[A-Za-z0-9_-]+'.  Probes the daemon
-before recording it."
+before recording it.  Refuses to register a second handle for a
+daemon already tracked under SERVER-NAME -- the server name is the
+daemon's identity, and a second handle would just leave one strand
+dangling against a dead server when the other is killed."
   (edmcp--spawn-validate-server-name server-name)
+  (when-let ((existing (edmcp--spawn-find-by-server-name server-name)))
+    (signal 'emacs-devtools-mcp-spawn-error
+            (list (format "daemon %s already tracked under handle %s"
+                          server-name existing))))
   (when (>= (hash-table-count emacs-devtools-mcp-spawn--handles)
             emacs-devtools-mcp-spawn-max-handles)
     (signal 'emacs-devtools-mcp-spawn-error
@@ -317,15 +342,30 @@ before recording it."
     rec))
 
 (defun emacs-devtools-mcp-spawn-kill (handle)
-  "Kill HANDLE's daemon and remove its record.  Return the dropped record."
+  "Drop HANDLE's record and, when not attached, kill its daemon.
+Returns the dropped record with an extra `:kill-status' field:
+  `attached'     -- handle was registered via `spawn-attach'; the
+                    user-owned daemon is left running.
+  `killed'       -- `(kill-emacs)' RPC succeeded.
+  `already-dead' -- RPC failed (rc/=0); the daemon was unreachable.
+The status surfaces through the public `kill_emacs' tool so a client
+can tell `we never knew about it' apart from `we knew, we tried, it
+was already dead'."
   (let* ((rec (edmcp--spawn-lookup handle))
-         (server-name (plist-get rec :server-name)))
-    (ignore-errors
-      (edmcp--spawn-call-process
-       emacs-devtools-mcp-spawn-emacsclient-program
-       (list "-s" server-name "--eval" "(kill-emacs)")))
+         (server-name (plist-get rec :server-name))
+         (status
+          (cond
+           ((plist-get rec :attached) 'attached)
+           (t
+            (let ((res (ignore-errors
+                         (edmcp--spawn-call-process
+                          emacs-devtools-mcp-spawn-emacsclient-program
+                          (list "-s" server-name "--eval" "(kill-emacs)")))))
+              (if (and (consp res) (zerop (car res)))
+                  'killed
+                'already-dead))))))
     (remhash handle emacs-devtools-mcp-spawn--handles)
-    rec))
+    (plist-put rec :kill-status status)))
 
 (defun emacs-devtools-mcp-spawn-list ()
   "Return a list of public handle plists, sorted by handle string."

@@ -184,16 +184,27 @@ start of the line, not a visual column -- a tab counts as one
 character regardless of `tab-width', and zero-width characters
 still advance the offset.  This matches `point' arithmetic and
 keeps the tool deterministic across display configurations.
+Out-of-range LINE or COLUMN values raise a structured error
+rather than silently clamping to point-min / point-max.
 Result has :face plus :foreground and :background resolved
 through `face-attribute' so the caller doesn't have to walk
 inheritance themselves."
   (let ((b (get-buffer buffer-name)))
     (unless b
       (error "Buffer not found: %s" buffer-name))
+    (unless (and (integerp line) (>= line 1))
+      (error "Line %S out of range (must be >= 1)" line))
+    (unless (and (integerp column) (>= column 0))
+      (error "Column %S out of range (must be >= 0)" column))
     (with-current-buffer b
       (save-excursion
         (goto-char (point-min))
-        (forward-line (1- line))
+        (let ((short (forward-line (1- line))))
+          (unless (zerop short)
+            (error "Line %d past end of buffer (only %d line%s)"
+                   line
+                   (- line short)
+                   (if (= 1 (- line short)) "" "s"))))
         (let* ((bol (line-beginning-position))
                (eol (line-end-position))
                (len (- eol bol)))

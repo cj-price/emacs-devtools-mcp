@@ -2198,6 +2198,245 @@ with `:already_gone t', not an `:isError' envelope."
      (should (string-match-p "already_gone" text))
      (should (string-match-p "true" text)))))
 
+(ert-deftest emacs-devtools-mcp-tests/spawn-kill-attached-spares-daemon ()
+  "Killing an attached handle drops the record without sending `kill-emacs'.
+Regression: `spawn-kill' previously ran `(kill-emacs)' against
+whatever daemon owned the handle's `:server-name', including
+user-owned daemons registered via `attach_emacs'.  An explicit
+`kill_emacs' call -- or a 30-min idle reaper sweep -- would then
+murder the user's real Emacs."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let ((now (float-time))
+         (calls nil))
+     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
+                (lambda (_program args &optional _b)
+                  (push args calls) (cons 0 ""))))
+       (puthash "att" (list :handle "att" :server-name "user-daemon"
+                            :pid 1 :headless nil :init nil :attached t
+                            :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (let ((dropped (emacs-devtools-mcp-spawn-kill "att")))
+         (should-not (gethash "att" emacs-devtools-mcp-spawn--handles))
+         (should (eq 'attached (plist-get dropped :kill-status))))
+       (should-not calls)))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-kill-spawned-sends-kill-emacs ()
+  "Killing a non-attached handle still runs the `(kill-emacs)' RPC."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let ((now (float-time))
+         (calls nil))
+     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
+                (lambda (_program args &optional _b)
+                  (push args calls) (cons 0 ""))))
+       (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
+                           :pid 2 :headless nil :init nil :attached nil
+                           :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (let ((dropped (emacs-devtools-mcp-spawn-kill "sp")))
+         (should-not (gethash "sp" emacs-devtools-mcp-spawn--handles))
+         (should (eq 'killed (plist-get dropped :kill-status))))
+       (should (cl-some (lambda (a)
+                          (and (member "edmcp-spawn-sp" a)
+                               (member "(kill-emacs)" a)))
+                        calls))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-kill-spawned-already-dead ()
+  "Non-zero rc from emacsclient marks the kill as `already-dead'."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let ((now (float-time)))
+     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
+                (lambda (&rest _) (cons 1 "no daemon"))))
+       (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
+                           :pid 3 :headless nil :init nil :attached nil
+                           :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (let ((dropped (emacs-devtools-mcp-spawn-kill "sp")))
+         (should (eq 'already-dead (plist-get dropped :kill-status))))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-reaper-skips-attached ()
+  "Reaper leaves attached handles alone even when long past idle timeout.
+The idle timeout is a resource cap on daemons this package
+started -- not a license to reap user-owned daemons that happen
+to have been registered via `attach_emacs'."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let* ((emacs-devtools-mcp-spawn-idle-timeout 60)
+          (now (float-time))
+          (calls nil))
+     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
+                (lambda (_program args &optional _b)
+                  (push args calls) (cons 0 ""))))
+       (puthash "att-stale"
+                (list :handle "att-stale" :server-name "user-daemon"
+                      :pid 1 :headless nil :init nil :attached t
+                      :created (- now 9999) :last-used (- now 9999))
+                emacs-devtools-mcp-spawn--handles)
+       (puthash "spawned-stale"
+                (list :handle "spawned-stale"
+                      :server-name "edmcp-spawn-spawned-stale"
+                      :pid 2 :headless nil :init nil :attached nil
+                      :created (- now 9999) :last-used (- now 9999))
+                emacs-devtools-mcp-spawn--handles)
+       (edmcp--spawn-reaper-tick)
+       ;; Attached survives.
+       (should (gethash "att-stale" emacs-devtools-mcp-spawn--handles))
+       ;; Spawned is reaped.
+       (should-not (gethash "spawned-stale"
+                            emacs-devtools-mcp-spawn--handles))
+       ;; No (kill-emacs) was sent against the attached daemon's name.
+       (should-not (cl-some (lambda (a) (member "user-daemon" a))
+                            calls))
+       ;; The spawned reap did call into emacsclient.
+       (should (cl-some (lambda (a)
+                          (member "edmcp-spawn-spawned-stale" a))
+                        calls))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-kill-all-spares-attached ()
+  "`spawn-kill-all' (run from `kill-emacs-hook') leaves attached daemons alive."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let ((now (float-time))
+         (calls nil))
+     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
+                (lambda (_program args &optional _b)
+                  (push args calls) (cons 0 ""))))
+       (puthash "att" (list :handle "att" :server-name "user-daemon"
+                            :pid 1 :headless nil :init nil :attached t
+                            :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
+                           :pid 2 :headless nil :init nil :attached nil
+                           :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (emacs-devtools-mcp-spawn-kill-all)
+       (should-not (cl-some (lambda (a) (member "user-daemon" a)) calls))
+       (should (cl-some (lambda (a)
+                          (and (member "edmcp-spawn-sp" a)
+                               (member "(kill-emacs)" a)))
+                        calls))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-attach-rejects-double-registration ()
+  "`attach-emacs' refuses to register a daemon already tracked.
+Two handles for the same daemon let an explicit kill or reaper
+sweep on one strand the other against a now-dead server name --
+the next eval through that handle then fails with an emacsclient
+connect error.  The server name is the daemon's identity; refuse."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let ((now (float-time))
+         (probed 0))
+     (cl-letf (((symbol-function 'edmcp--spawn-emacsclient-ping)
+                (lambda (&rest _) (cl-incf probed) 4242)))
+       (puthash "h0" (list :handle "h0" :server-name "edmcp-spawn-shared"
+                           :pid 1 :headless nil :init nil :attached nil
+                           :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (let ((err (should-error
+                   (emacs-devtools-mcp-spawn-attach "edmcp-spawn-shared")
+                   :type 'emacs-devtools-mcp-spawn-error)))
+         (should (string-match-p "already tracked" (cadr err))))
+       ;; Refusal happens before (and instead of) probing the daemon.
+       (should (zerop probed))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-tool-kill-status-field ()
+  "`kill_emacs' tool envelope carries a `status' field distinguishing states.
+Three terminal states must be observable: `unknown_handle' (we
+never knew about it), `killed' (RPC succeeded), `already_dead'
+(handle was registered but its daemon did not answer).  The
+older `already_gone' boolean stays for backwards compatibility."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   ;; Unknown handle -- we never knew about it.
+   (let* ((env (edmcp--server-tools-call
+                nil
+                (list :name "kill_emacs"
+                      :arguments (list :handle "never-existed"))))
+          (text (plist-get (aref (plist-get env :content) 0) :text)))
+     (should (string-match-p "\"status\":[ ]*\"unknown_handle\"" text))
+     (should (string-match-p "\"already_gone\":[ ]*true" text)))
+   ;; Registered, RPC succeeds -> killed.
+   (let ((now (float-time)))
+     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
+                (lambda (&rest _) (cons 0 ""))))
+       (puthash "live" (list :handle "live" :server-name "edmcp-spawn-live"
+                             :pid 1 :headless nil :init nil :attached nil
+                             :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (let* ((env (edmcp--server-tools-call
+                    nil
+                    (list :name "kill_emacs"
+                          :arguments (list :handle "live"))))
+              (text (plist-get (aref (plist-get env :content) 0) :text)))
+         (should (string-match-p "\"status\":[ ]*\"killed\"" text))
+         (should (string-match-p "\"already_gone\":[ ]*false" text)))))
+   ;; Registered, RPC fails -> already_dead.
+   (let ((now (float-time)))
+     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
+                (lambda (&rest _) (cons 1 "no daemon"))))
+       (puthash "dead" (list :handle "dead" :server-name "edmcp-spawn-dead"
+                             :pid 2 :headless nil :init nil :attached nil
+                             :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (let* ((env (edmcp--server-tools-call
+                    nil
+                    (list :name "kill_emacs"
+                          :arguments (list :handle "dead"))))
+              (text (plist-get (aref (plist-get env :content) 0) :text)))
+         (should (string-match-p "\"status\":[ ]*\"already_dead\"" text))
+         (should (string-match-p "\"already_gone\":[ ]*true" text)))))))
+
+(ert-deftest emacs-devtools-mcp-tests/auth-init-path-no-existence-leak ()
+  "Off-allowlist paths give the same error whether the file exists or not.
+Pre-fix, `validate-init-path' returned distinct errors -- `Init
+file does not exist: PATH' for absent paths and `Init path PATH
+outside allowlist' for present off-allowlist paths -- letting an
+authenticated agent probe arbitrary filesystem locations for
+presence by reading which message it got back."
+  :tags '(:fast)
+  (let* ((existing (make-temp-file "edmcp-leak-exists-" nil ".el"))
+         (allow-dir (make-temp-file "edmcp-leak-allow-" t)))
+    (unwind-protect
+        (let ((emacs-devtools-mcp-init-allowlist (list allow-dir)))
+          (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
+            (let ((existing-err
+                   (cadr (should-error
+                          (emacs-devtools-mcp-auth-validate-init-path existing)
+                          :type 'user-error)))
+                  (absent-err
+                   (cadr (should-error
+                          (emacs-devtools-mcp-auth-validate-init-path
+                           "/nope/leak/probe.el")
+                          :type 'user-error))))
+              ;; Both must use the `outside allowlist' wording -- never
+              ;; the `does not exist' wording, which would distinguish
+              ;; the two cases.
+              (should (string-match-p "outside allowlist" existing-err))
+              (should (string-match-p "outside allowlist" absent-err))
+              (should-not (string-match-p "does not exist" existing-err))
+              (should-not (string-match-p "does not exist" absent-err)))))
+      (delete-file existing)
+      (delete-directory allow-dir t))))
+
+(ert-deftest emacs-devtools-mcp-tests/auth-init-path-in-allowlist-still-existence-checks ()
+  "An in-allowlist path that does not exist still surfaces a clear error.
+The presence check is preserved for paths whose expanded form
+matches an allowlist prefix -- the agent already has scope to
+read those, so revealing existence costs nothing."
+  :tags '(:fast)
+  (let ((allow-dir (make-temp-file "edmcp-allow-exists-" t)))
+    (unwind-protect
+        (let ((emacs-devtools-mcp-init-allowlist (list allow-dir)))
+          (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
+            (let ((err (cadr (should-error
+                              (emacs-devtools-mcp-auth-validate-init-path
+                               (expand-file-name "missing.el" allow-dir))
+                              :type 'user-error))))
+              (should (string-match-p "does not exist" err)))))
+      (delete-directory allow-dir t))))
+
 ;;;; ___Spawn lifecycle (real daemon)___
 ;;
 ;; Tests tagged `:daemon' actually spawn a subordinate Emacs daemon.
@@ -2879,6 +3118,20 @@ many frames the runtime records."
       (should-not (string-match-p "auth-source-edmcp-list-messages-drop"
                                   joined)))))
 
+(ert-deftest emacs-devtools-mcp-tests/list-messages-rejects-non-positive-n ()
+  "`list-messages' with `n <= 0' raises rather than silently returning `[]'.
+Pre-fix, `n=0' and `n=-1' both flowed through `(last lines 0)'
+and produced an empty result -- the agent saw no messages and
+had no signal that the call had been malformed."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-fresh-cursors
+    (let ((message-log-max 4096))
+      (message "edmcp-list-messages-n0-keep"))
+    (should-error (edmcp--tools-list-messages '(:n 0)))
+    (should-error (edmcp--tools-list-messages '(:n -1)))
+    ;; nil n is still accepted (defaults to page size).
+    (should (edmcp--tools-list-messages '()))))
+
 (ert-deftest emacs-devtools-mcp-tests/list-warnings-returns-empty-when-no-buffer ()
   "If *Warnings* doesn't exist, the result is an empty array."
   :tags '(:fast)
@@ -3149,6 +3402,64 @@ passes through unchanged."
         (let ((res (edmcp--tools-where-is `(:command ,(symbol-name sym)))))
           (should (vectorp (plist-get res :bindings)))
           (should (= 0 (length (plist-get res :bindings)))))
+      (fmakunbound sym)
+      (unintern sym nil))))
+
+(ert-deftest emacs-devtools-mcp-tests/where-is-filters-menu-bar-pseudo-bindings ()
+  "Menu-bar / tool-bar / remap entries don't appear alongside real keys.
+`where-is-internal' returns sequences like `[menu-bar file
+new-file]' or `[remap forward-char]' for commands reachable
+through menus; surfacing those next to actual key sequences was
+noise for agents trying to discover keystrokes."
+  :tags '(:fast)
+  (let* ((sym (intern (format "edmcp-where-is-menu-fn-%d" (random 100000))))
+         (menu-map (make-sparse-keymap))
+         (real-map (make-sparse-keymap))
+         (top (make-sparse-keymap))
+         (map-sym (intern (format "edmcp-where-is-map-%d" (random 100000)))))
+    (defalias sym (lambda () (interactive) nil))
+    (define-key menu-map [my-entry]
+                (cons "Do thing" sym))
+    (define-key real-map (kbd "a") sym)
+    (define-key top [menu-bar my-menu] (cons "My" menu-map))
+    (set-keymap-parent top real-map)
+    (set map-sym top)
+    (unwind-protect
+        (let* ((res (edmcp--tools-where-is
+                     (list :command (symbol-name sym)
+                           :keymap (symbol-name map-sym))))
+               (binds (append (plist-get res :bindings) nil)))
+          ;; The real `a' binding is present.
+          (should (member "a" binds))
+          ;; Menu-bar pseudo-bindings are filtered out.
+          (should-not (cl-some (lambda (k) (string-match-p "menu-bar" k))
+                               binds)))
+      (makunbound map-sym)
+      (unintern map-sym nil)
+      (fmakunbound sym)
+      (unintern sym nil))))
+
+(ert-deftest emacs-devtools-mcp-tests/where-is-filters-remap-bindings ()
+  "`[remap COMMAND]' entries are filtered out of `where-is' results."
+  :tags '(:fast)
+  (let* ((sym (intern (format "edmcp-where-is-remap-%d" (random 100000))))
+         (map (make-sparse-keymap))
+         (map-sym (intern (format "edmcp-where-is-remap-map-%d"
+                                  (random 100000)))))
+    (defalias sym (lambda () (interactive) nil))
+    (define-key map (kbd "g") sym)
+    (define-key map [remap forward-char] sym)
+    (set map-sym map)
+    (unwind-protect
+        (let* ((res (edmcp--tools-where-is
+                     (list :command (symbol-name sym)
+                           :keymap (symbol-name map-sym))))
+               (binds (append (plist-get res :bindings) nil)))
+          (should (member "g" binds))
+          (should-not (cl-some (lambda (k) (string-match-p "remap" k))
+                               binds)))
+      (makunbound map-sym)
+      (unintern map-sym nil)
       (fmakunbound sym)
       (unintern sym nil))))
 
@@ -3466,6 +3777,38 @@ passes through unchanged."
     (should-error
      (edmcp--tools-face-at
       '(:buffer "edmcp-face-oob" :line 1 :column 50)))))
+
+(ert-deftest emacs-devtools-mcp-tests/face-at-out-of-range-line-rejected ()
+  "Lines past end-of-buffer (or below 1) raise rather than clamping silently.
+Pre-fix, `line=99999' on a small buffer dropped to point-max and
+`line=0' silently moved backwards from point-min, so the agent
+got back a face for whatever happened to be there -- with no way
+to tell the call had used an out-of-range coordinate."
+  :tags '(:fast)
+  (with-temp-buffer
+    (rename-buffer "edmcp-face-line-oob" t)
+    (insert "one\ntwo\nthree")
+    ;; Past end of buffer.
+    (should-error
+     (edmcp--tools-face-at
+      '(:buffer "edmcp-face-line-oob" :line 99999 :column 0)))
+    ;; Zero / negative.
+    (should-error
+     (edmcp--tools-face-at
+      '(:buffer "edmcp-face-line-oob" :line 0 :column 0)))
+    (should-error
+     (edmcp--tools-face-at
+      '(:buffer "edmcp-face-line-oob" :line -1 :column 0)))))
+
+(ert-deftest emacs-devtools-mcp-tests/face-at-negative-column-rejected ()
+  "Negative column raises rather than clamping to bol."
+  :tags '(:fast)
+  (with-temp-buffer
+    (rename-buffer "edmcp-face-col-neg" t)
+    (insert "abc")
+    (should-error
+     (edmcp--tools-face-at
+      '(:buffer "edmcp-face-col-neg" :line 1 :column -1)))))
 
 (ert-deftest emacs-devtools-mcp-tests/describe-face-default ()
   "`default' face has a name and an attribute alist."

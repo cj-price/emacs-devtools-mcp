@@ -87,15 +87,38 @@ closure environments) so it survives the spawn round-trip."
    ((functionp binding) "#<function>")
    (t (prin1-to-string binding))))
 
+(defconst emacs-devtools-mcp-tools-keys--menu-prefixes
+  '(menu-bar tool-bar tab-bar tab-line header-line mode-line)
+  "Pseudo-key prefixes that denote menu/tool-bar entries, not real bindings.
+`where-is' filters sequences whose first event is one of these
+symbols -- they're how Emacs models clickable bar entries, but
+they aren't keys an agent (or human) types, so surfacing them as
+bindings would just be noise.")
+
+(defun emacs-devtools-mcp-tools-keys--menu-binding-p (key)
+  "Return non-nil when KEY's first event denotes a menu/bar pseudo-binding.
+Also rejects `[remap COMMAND]' entries -- those are remapping
+machinery, not actual key sequences."
+  (and (vectorp key)
+       (> (length key) 0)
+       (or (memq (aref key 0)
+                 emacs-devtools-mcp-tools-keys--menu-prefixes)
+           (eq (aref key 0) 'remap))))
+
 (defun emacs-devtools-mcp-tools-keys--where-is (command keymap-name)
   "Return key bindings for COMMAND in the resolved KEYMAP-NAME.
 COMMAND is a string command name; KEYMAP-NAME is nil (global) or a
-string.  Result is a list of human-readable key descriptions."
+string.  Result is a list of human-readable key descriptions with
+menu-bar / tool-bar / tab-bar / header-line / mode-line / remap
+pseudo-bindings filtered out -- they're noise for agents looking
+for actual key sequences."
   (let* ((sym (intern-soft command))
          (map (emacs-devtools-mcp-tools-keys--resolve-keymap keymap-name)))
     (unless (and sym (fboundp sym))
       (error "Unknown command: %s" command))
-    (mapcar #'key-description (where-is-internal sym map nil))))
+    (mapcar #'key-description
+            (cl-remove-if #'emacs-devtools-mcp-tools-keys--menu-binding-p
+                          (where-is-internal sym map nil)))))
 
 (defun emacs-devtools-mcp-tools-keys--lookup-key (keys keymap-name accept-default)
   "Return the binding for KEYS in KEYMAP-NAME (or global when nil).
