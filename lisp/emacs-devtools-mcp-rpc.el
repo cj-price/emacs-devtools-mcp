@@ -194,6 +194,10 @@ Cancels outstanding continuations and runs the connection's
   (when (and (not (process-live-p proc))
              (process-get proc 'jsonrpc-connection))
     (let ((conn (process-get proc 'jsonrpc-connection)))
+      ;; `jsonrpc-connection' exposes the continuations alist via the
+      ;; private `:accessor jsonrpc--continuations'.  On Emacs 29.x the
+      ;; byte compiler doesn't see eieio accessor methods as fbound, so
+      ;; reach into the slot via `eieio-oref' (a public, fbound API).
       (mapc (lambda (cont)
               (pcase-let ((`(,_id ,_method ,_succ ,error-fn ,timer) cont))
                 (when timer (cancel-timer timer))
@@ -202,7 +206,7 @@ Cancels outstanding continuations and runs the connection's
                     (funcall error-fn
                              (list :code -1
                                    :message "Connection died"))))))
-            (jsonrpc--continuations conn))
+            (eieio-oref conn '-continuations))
       (jsonrpc-forget-pending-continuations conn)
       (ignore-errors
         (funcall (edmcp--rpc-on-shutdown conn) conn)))))
