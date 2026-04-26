@@ -39,16 +39,20 @@
 (defun emacs-devtools-mcp-random-hex (n-bytes)
   "Return a hex string of N-BYTES bytes drawn from `/dev/urandom'.
 Used for both the per-launch auth token and pagination cursor
-identifiers.  Falls back to `random' (with a one-time warning) on
-systems without `/dev/urandom' so this never silently degrades to
-no token at all -- but Linux/BSD/macOS always succeed via the
-primary path."
+identifiers.  Reads through `head -c N-BYTES /dev/urandom' because
+`insert-file-contents-literally' silently returns zero bytes on
+character devices when given a BEG/END range.  Falls back to
+`random' (with a warning) only if the subprocess fails or returns
+short -- on Linux/BSD/macOS the primary path always succeeds."
   (or (ignore-errors
         (with-temp-buffer
           (set-buffer-multibyte nil)
-          (insert-file-contents-literally "/dev/urandom" nil 0 n-bytes)
-          (let ((bytes (buffer-string)))
-            (when (= (length bytes) n-bytes)
+          (let* ((default-directory "/")
+                 (rc (call-process "head" nil (list (current-buffer) nil) nil
+                                   "-c" (number-to-string n-bytes)
+                                   "/dev/urandom"))
+                 (bytes (buffer-string)))
+            (when (and (eq rc 0) (= (length bytes) n-bytes))
               (mapconcat (lambda (b) (format "%02x" b)) bytes "")))))
       (progn
         (display-warning

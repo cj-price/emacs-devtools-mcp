@@ -1476,6 +1476,73 @@ The redaction is line-grain, deliberately conservative."
   (let ((input "calling auth-source-foo here\nfine line"))
     (should (equal "fine line" (emacs-devtools-mcp-redact input)))))
 
+;;;; ___Random hex___
+
+;; Regression: an earlier implementation read `/dev/urandom' via
+;; `insert-file-contents-literally' with a BEG/END range, which silently
+;; returns zero bytes on character devices.  Every token then came from
+;; the `(random)' fallback, accompanied by a warning.  These tests pin
+;; down both that the primary path actually produces N bytes of entropy
+;; *without* tripping the warning, and that the fallback still works
+;; when the subprocess is unavailable.
+
+(ert-deftest emacs-devtools-mcp-tests/random-hex-returns-2n-hex-chars ()
+  "Tokens are 2*N lowercase hex chars and vary across calls."
+  :tags '(:fast)
+  (let ((a (emacs-devtools-mcp-random-hex 16))
+        (b (emacs-devtools-mcp-random-hex 16)))
+    (should (= 32 (length a)))
+    (should (= 32 (length b)))
+    (should (string-match-p "\\`[0-9a-f]+\\'" a))
+    (should (string-match-p "\\`[0-9a-f]+\\'" b))
+    ;; Two consecutive 16-byte draws colliding has probability 2^-128;
+    ;; if this ever fails, buy a lottery ticket.
+    (should-not (equal a b))))
+
+(ert-deftest emacs-devtools-mcp-tests/random-hex-primary-path-is-silent ()
+  "On a working system the urandom path runs without warning."
+  :tags '(:fast)
+  (skip-unless (file-readable-p "/dev/urandom"))
+  (skip-unless (executable-find "head"))
+  (let ((warnings nil))
+    (cl-letf (((symbol-function 'display-warning)
+               (lambda (&rest args) (push args warnings))))
+      (let ((token (emacs-devtools-mcp-random-hex 16)))
+        (should (= 32 (length token)))
+        (should (null warnings))))))
+
+(ert-deftest emacs-devtools-mcp-tests/random-hex-falls-back-on-subprocess-failure ()
+  "If the subprocess fails, fallback warns and still returns 2*N chars."
+  :tags '(:fast)
+  (let ((warnings nil))
+    (cl-letf (((symbol-function 'call-process)
+               (lambda (&rest _) (signal 'file-error '("simulated failure"))))
+              ((symbol-function 'display-warning)
+               (lambda (&rest args) (push args warnings))))
+      (let ((token (emacs-devtools-mcp-random-hex 8)))
+        (should (= 16 (length token)))
+        (should (string-match-p "\\`[0-9a-f]+\\'" token))
+        (should (= 1 (length warnings)))
+        (should (eq 'emacs-devtools-mcp (caar warnings)))))))
+
+(ert-deftest emacs-devtools-mcp-tests/random-hex-falls-back-on-short-read ()
+  "If the subprocess returns fewer bytes than requested, fall back."
+  :tags '(:fast)
+  (let ((warnings nil))
+    (cl-letf (((symbol-function 'call-process)
+               (lambda (_program _infile destination &rest _args)
+                 ;; Pretend success but only deliver one byte.
+                 (let ((buf (if (consp destination) (car destination)
+                              destination)))
+                   (when (bufferp buf)
+                     (with-current-buffer buf (insert "X"))))
+                 0))
+              ((symbol-function 'display-warning)
+               (lambda (&rest args) (push args warnings))))
+      (let ((token (emacs-devtools-mcp-random-hex 16)))
+        (should (= 32 (length token)))
+        (should (= 1 (length warnings)))))))
+
 ;;;; ___Cursor store___
 
 (ert-deftest emacs-devtools-mcp-tests/cursor-roundtrip ()
