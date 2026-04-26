@@ -183,9 +183,11 @@ test (use it sparingly -- the slow-tool timeout still applies)."
           :ok (if (zerop failed) t :json-false))))
 
 (defun emacs-devtools-mcp-tools-buffer--describe-hooks (hook)
-  "Describe HOOK or, when HOOK is nil, return a list of all bound hook symbols.
-A bound hook is any symbol whose name ends in `-hook' that is
-fboundp or whose value is a list."
+  "Describe HOOK or, when HOOK is nil, list every bound hook symbol.
+A bound hook is any symbol whose name ends in `-hook' whose value
+is a list.  Returns a JSON-shaped plist in either branch:
+  nil HOOK   -> (:hooks [\"name1\" \"name2\" ...])
+  named HOOK -> (:name STR :functions [\"f1\" ...])"
   (cond
    ((null hook)
     (let (hooks)
@@ -196,20 +198,21 @@ fboundp or whose value is a list."
                       (boundp s)
                       (listp (symbol-value s)))
              (push n hooks)))))
-      (sort hooks #'string<)))
+      (list :hooks (vconcat (sort hooks #'string<)))))
    (t
     (let* ((sym (if (stringp hook) (intern-soft hook) hook)))
       (unless (and sym (boundp sym))
         (error "Unbound hook: %s" hook))
       (list :name (symbol-name sym)
             :functions
-            (mapcar (lambda (f)
-                      (cond
-                       ((symbolp f) (symbol-name f))
-                       ((byte-code-function-p f) "#<bytecode>")
-                       ((functionp f) (format "%S" f))
-                       (t (format "%S" f))))
-                    (symbol-value sym)))))))
+            (vconcat
+             (mapcar (lambda (f)
+                       (cond
+                        ((symbolp f) (symbol-name f))
+                        ((byte-code-function-p f) "#<bytecode>")
+                        ((functionp f) (format "%S" f))
+                        (t (format "%S" f))))
+                     (symbol-value sym))))))))
 
 ;;;; Tool handlers.
 

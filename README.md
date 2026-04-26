@@ -160,7 +160,8 @@ ones you are most likely to touch:
 |---|---|---|
 | `emacs-devtools-mcp-server-name` | `"default"` | Socket name segment under `${XDG_RUNTIME_DIR}/edmcp/`. |
 | `emacs-devtools-mcp-init-allowlist` | `~/.config/emacs`, `~/.emacs.d`, project root | Paths agents may pass to `bisect_init` / `init_lint` / `startup_profile` / `spawn_emacs`. |
-| `emacs-devtools-mcp-max-response-bytes` | `262144` | Global hard cap on per-call payload. |
+| `emacs-devtools-mcp-max-response-bytes` | `262144` | Global hard cap on per-call payload (text). |
+| `emacs-devtools-mcp-max-image-response-bytes` | `8388608` | Cap for responses that include an MCP `image` block. |
 | `emacs-devtools-mcp-screenshot-max-pixels` | `1920×1080` | Refuse oversize frames. |
 | `emacs-devtools-mcp-spawn-idle-timeout` | `1800` | Reaper kills idle handles after this many seconds. |
 | `emacs-devtools-mcp-spawn-max-handles` | `4` | Cap on simultaneous subordinate daemons. |
@@ -195,9 +196,10 @@ What is defended:
   even before `read` ever runs.
 - **Init paths**. Allowlist-checked via `expand-file-name` + `file-truename`
   + prefix match, against `emacs-devtools-mcp-init-allowlist`.
-- **Output**. Redaction layer scrubs lines mentioning `auth-source-`, `epg-`,
-  and `tramp-` (plus `redact-extra-regexps`) from any *Messages* / backtrace /
-  profiler-frame surface before it leaves the host.
+- **Output**. Redaction layer scrubs lines that *start with* `auth-source-`,
+  `epg-`, or `tramp-` (plus `redact-extra-regexps`) from any *Messages* /
+  backtrace / profiler-frame surface before it leaves the host. Anchoring to
+  line-start avoids hiding legitimate mid-line mentions of those prefixes.
 - **Resource caps**. `with-timeout` on every `:slow` handler;
   `max-response-bytes`; `screenshot-max-pixels`; `unwind-protect` around
   `profiler-start`.

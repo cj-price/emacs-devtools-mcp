@@ -1486,12 +1486,52 @@ wrapping, and the spawn-call host branch in one round-trip."
                    (emacs-devtools-mcp-redact
                     "kept\nSECRET: hunter2\nauth-source-banana")))))
 
-(ert-deftest emacs-devtools-mcp-tests/redact-preserves-non-matching-content ()
-  "Lines that merely contain the literal `auth-source' inside other text are dropped.
-The redaction is line-grain, deliberately conservative."
+(ert-deftest emacs-devtools-mcp-tests/redact-preserves-mid-line-mentions ()
+  "Lines that merely *contain* a redacted prefix mid-line are kept.
+Defaults are anchored to line-start (`^auth-source-' etc.), so a
+backtrace frame whose function name happens to mention
+`auth-source-' as a substring (e.g. `my-pkg-call-auth-source-foo')
+no longer disappears -- which would otherwise hide the very
+information the user asked for."
   :tags '(:fast)
-  (let ((input "calling auth-source-foo here\nfine line"))
-    (should (equal "fine line" (emacs-devtools-mcp-redact input)))))
+  (let ((input (concat "calling auth-source-foo here\n"
+                       "frame: epg-thing\n"
+                       "frame: my-tramp-helper\n"
+                       "fine line")))
+    (should (equal input (emacs-devtools-mcp-redact input)))))
+
+(ert-deftest emacs-devtools-mcp-tests/redact-line-start-prefix-still-dropped ()
+  "Line-start matches are still dropped after the anchoring fix."
+  :tags '(:fast)
+  (let ((input (concat "auth-source-search: foo\n"
+                       "epg-decrypt-string failed\n"
+                       "tramp-handle-file-attributes\n"
+                       "kept")))
+    (should (equal "kept" (emacs-devtools-mcp-redact input)))))
+
+(ert-deftest emacs-devtools-mcp-tests/redact-handles-backtrace-frames ()
+  "Indented `(auth-source-...)' frames in backtraces are scrubbed.
+Real backtrace lines from `debug' / `backtrace-frame' typically
+look like \"  (auth-source-search ...)\", so the default regexps
+must tolerate leading whitespace and an opening paren."
+  :tags '(:fast)
+  (let ((input (concat "(auth-source-search t)\n"
+                       "  (auth-source-search t)\n"
+                       "\t(epg-decrypt-string foo)\n"
+                       " (tramp-handle-file-attributes path)\n"
+                       "kept frame\n"
+                       "  (some-other-fn 1 2)")))
+    (should (equal "kept frame\n  (some-other-fn 1 2)"
+                   (emacs-devtools-mcp-redact input)))))
+
+(ert-deftest emacs-devtools-mcp-tests/redact-keeps-substring-frame-names ()
+  "Frames whose name *contains* a redacted prefix mid-token are kept.
+A backtrace entry like `(my-pkg-call-auth-source-foo ...)' would
+disappear if the regex weren't anchored to a leading whitespace /
+paren run -- this test pins the boundary."
+  :tags '(:fast)
+  (let ((input "  (my-pkg-call-auth-source-foo arg)"))
+    (should (equal input (emacs-devtools-mcp-redact input)))))
 
 ;;;; ___Random hex___
 
@@ -1529,7 +1569,12 @@ The redaction is line-grain, deliberately conservative."
         (should (null warnings))))))
 
 (ert-deftest emacs-devtools-mcp-tests/random-hex-falls-back-on-subprocess-failure ()
-  "If the subprocess fails, fallback warns and still returns 2*N chars."
+  "If the subprocess fails, fallback silently returns 2*N chars.
+The earlier behaviour was to fire a `display-warning' on every
+fallback, which polluted *Warnings* with a stale entry whenever
+`/dev/urandom' was momentarily unreadable.  The fallback path is
+correctness-equivalent (only the entropy source weakens), so the
+warning is gone."
   :tags '(:fast)
   (let ((warnings nil))
     (cl-letf (((symbol-function 'call-process)
@@ -1539,11 +1584,10 @@ The redaction is line-grain, deliberately conservative."
       (let ((token (emacs-devtools-mcp-random-hex 8)))
         (should (= 16 (length token)))
         (should (string-match-p "\\`[0-9a-f]+\\'" token))
-        (should (= 1 (length warnings)))
-        (should (eq 'emacs-devtools-mcp (caar warnings)))))))
+        (should (null warnings))))))
 
 (ert-deftest emacs-devtools-mcp-tests/random-hex-falls-back-on-short-read ()
-  "If the subprocess returns fewer bytes than requested, fall back."
+  "If the subprocess returns fewer bytes than requested, fall back silently."
   :tags '(:fast)
   (let ((warnings nil))
     (cl-letf (((symbol-function 'call-process)
@@ -1558,7 +1602,7 @@ The redaction is line-grain, deliberately conservative."
                (lambda (&rest args) (push args warnings))))
       (let ((token (emacs-devtools-mcp-random-hex 16)))
         (should (= 32 (length token)))
-        (should (= 1 (length warnings)))))))
+        (should (null warnings))))))
 
 ;;;; ___Cursor store___
 
@@ -1876,6 +1920,68 @@ kill -- so the field is removed from the public schema."
                :type 'emacs-devtools-mcp-spawn-error)))
      (should (string-match-p "headless" (cadr err))))))
 
+(ert-deftest emacs-devtools-mcp-tests/spawn-bootstrap-args-load-package ()
+  "`edmcp--spawn-bootstrap-args' produces argv that loads the package.
+
+Regression: every `target: {\"spawn\": \"<handle>\"}' tool call
+went out as a `(emacs-devtools-mcp-tools-*-...)' form to a daemon
+launched with `emacs -Q', which had never loaded any of those
+modules; emacsclient came back with `void-function'.  The
+bootstrap argv adds the package directory to `load-path' and
+`require's both `emacs-devtools-mcp' and
+`emacs-devtools-mcp-server', the latter triggering the
+eval-after-load chain that pulls in every tool subsystem."
+  :tags '(:fast)
+  (let* ((args (edmcp--spawn-bootstrap-args)))
+    (should (member "-L" args))
+    (let ((dir (cadr (member "-L" args))))
+      (should (stringp dir))
+      (should (file-directory-p dir))
+      (should (file-exists-p
+               (expand-file-name "emacs-devtools-mcp.el" dir))))
+    ;; Both modules are explicitly required.  The host package's
+    ;; `eval-after-load 'emacs-devtools-mcp-server' chain takes care
+    ;; of pulling in the tool subsystems once `-server' loads.
+    (should (cl-find-if (lambda (s)
+                          (and (stringp s)
+                               (string-match-p
+                                "(require 'emacs-devtools-mcp)" s)))
+                        args))
+    (should (cl-find-if (lambda (s)
+                          (and (stringp s)
+                               (string-match-p
+                                "(require 'emacs-devtools-mcp-server)" s)))
+                        args))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-start-bg-daemon-injects-bootstrap ()
+  "`edmcp--spawn-start-bg-daemon' actually wires the bootstrap argv in.
+Captures the argv passed to `edmcp--spawn-call-process' and asserts
+the load-path injection appears between the `--bg-daemon' flag and
+any caller-supplied EXTRA-ARGS (so `-l USER-INIT' runs *after* the
+package loads)."
+  :tags '(:fast)
+  (let ((captured-args nil))
+    (cl-letf (((symbol-function 'edmcp--spawn-call-process)
+               (lambda (_program args)
+                 (setq captured-args args)
+                 (cons 0 "")))
+              ((symbol-function 'edmcp--spawn-wait-ready)
+               (lambda (_n) 4242)))
+      (edmcp--spawn-start-bg-daemon "edmcp-spawn-test" '("-l" "/tmp/x.el")))
+    (should captured-args)
+    (let* ((daemon-pos (cl-position-if
+                        (lambda (s) (string-match-p "--bg-daemon=" s))
+                        captured-args))
+           (load-path-pos (cl-position "-L" captured-args :test #'equal))
+           (user-init-pos (cl-position "/tmp/x.el" captured-args
+                                       :test #'equal)))
+      (should daemon-pos)
+      (should load-path-pos)
+      (should user-init-pos)
+      ;; Order: --bg-daemon=NAME ... -L DIR ... -l /tmp/x.el
+      (should (< daemon-pos load-path-pos))
+      (should (< load-path-pos user-init-pos)))))
+
 (ert-deftest emacs-devtools-mcp-tests/spawn-max-handles-cap ()
   "Spawning past `max-handles' is rejected without invoking `make-process'."
   :tags '(:fast)
@@ -1936,7 +2042,11 @@ kill -- so the field is removed from the public schema."
        :type 'user-error))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-init-allowlist-symlink-escape ()
-  "A symlink whose target is outside the allowlist is rejected."
+  "A symlink whose target is outside the allowlist is rejected.
+The allowlist here (`~/.config/emacs') matches *neither* the
+expanded link path (under `/tmp') nor the resolved target (also
+under `/tmp'), so the OR-of-prefixes check still rejects this
+case after the bug-5 fix."
   :tags '(:fast)
   (let* ((outside (make-temp-file "edmcp-sym-out-" nil ".el"))
          (allow-dir (make-temp-file "edmcp-allow-" t))
@@ -1951,6 +2061,57 @@ kill -- so the field is removed from the public schema."
              :type 'user-error)))
       (delete-file outside)
       (delete-directory allow-dir t))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-init-allowlist-symlink-into-allowed-dir ()
+  "Symlinks under an allowed dir resolve via the link path, not the target.
+
+Real-world driver: NixOS / home-manager users have
+`~/.config/emacs/init.el' symlinked into the read-only
+`/nix/store/...' tree.  Pre-fix, the allowlist resolved the
+target through `file-truename' and then prefix-checked against
+`~/.config/emacs', which never matched a `/nix/store/...' real
+path -- so `init_lint' / `bisect_init' / `startup_profile' were
+unusable on those systems.  The fix accepts the path when *either*
+its expanded form or its resolved form lies under the allowlist."
+  :tags '(:fast)
+  (let* ((target (make-temp-file "edmcp-sym-target-" nil ".el"))
+         (allow-dir (make-temp-file "edmcp-allow-real-" t))
+         (link (expand-file-name "init.el" allow-dir)))
+    (unwind-protect
+        (let ((emacs-devtools-mcp-init-allowlist (list allow-dir)))
+          (write-region "(setq edmcp-sym-test 1)\n" nil target)
+          (make-symbolic-link target link)
+          (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
+            (let ((real (emacs-devtools-mcp-auth-validate-init-path link)))
+              ;; Returns the *resolved* path (truename), but the path was
+              ;; accepted because the link itself is under allow-dir.
+              (should (equal real (file-truename target))))))
+      (delete-file target)
+      (delete-directory allow-dir t))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-init-allowlist-real-only-match ()
+  "Symmetric case: ABS off-allowlist but the truename REAL is under allowlist.
+The OR-semantics in `validate-init-path' admits both the
+NixOS-style case (ABS matches, REAL is in `/nix/store') and this
+inverted case where the link itself sits outside the allowlist
+but resolves into it.  Pins the second branch so a future
+single-arm regression doesn't pass the existing tests."
+  :tags '(:fast)
+  (let* ((allow-dir (make-temp-file "edmcp-allow-target-" t))
+         (target (expand-file-name "init.el" allow-dir))
+         (link-dir (make-temp-file "edmcp-link-out-" t))
+         (link (expand-file-name "shim.el" link-dir)))
+    (unwind-protect
+        (let ((emacs-devtools-mcp-init-allowlist (list allow-dir)))
+          (write-region "(setq edmcp-real-only 1)\n" nil target)
+          (make-symbolic-link target link)
+          (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
+            (let ((real (emacs-devtools-mcp-auth-validate-init-path link)))
+              (should (equal real (file-truename target))))))
+      (delete-file link)
+      (delete-file target)
+      (delete-directory allow-dir t)
+      (delete-directory link-dir t))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-tool-list-handles-cursor ()
   "list-handles paginates with cursor when count > page size."
@@ -2102,6 +2263,37 @@ the package in the subordinate, which is a separate enhancement."
                  (spawn-val (emacs-devtools-mcp-spawn-call
                              (list :spawn handle) form)))
              (should (equal host-val spawn-val))))
+       (when (gethash handle emacs-devtools-mcp-spawn--handles)
+         (ignore-errors (emacs-devtools-mcp-spawn-kill handle)))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-real-bootstrap-loads-package ()
+  "Spawned daemons have `emacs-devtools-mcp' preloaded via bootstrap argv.
+Bug-2 regression test: previously the subordinate `emacs -Q' came
+up bare, so any tool needing package symbols (like
+`emacs-devtools-mcp-redact') failed in spawn but worked on host.
+The bootstrap now appends `-L LISP-DIR --eval (require ...)' to
+the daemon argv so package-aware code paths reach parity."
+  :tags '(:daemon)
+  (skip-unless (emacs-devtools-mcp-tests--daemon-available-p))
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let* ((rec (emacs-devtools-mcp-spawn-spawn))
+          (handle (plist-get rec :handle))
+          (target (list :spawn handle)))
+     (unwind-protect
+         (progn
+           (should (eq t (emacs-devtools-mcp-spawn-call
+                          target '(featurep 'emacs-devtools-mcp))))
+           (should (eq t (emacs-devtools-mcp-spawn-call
+                          target '(featurep 'emacs-devtools-mcp-server))))
+           ;; A package-defined symbol is callable -- redact strips
+           ;; auth-source-* lines, which is a function the host suite
+           ;; covers in :fast tests.  Asserting it works *in the
+           ;; subordinate* pins the bootstrap path end-to-end.
+           (should (equal "kept"
+                          (emacs-devtools-mcp-spawn-call
+                           target
+                           '(emacs-devtools-mcp-redact
+                             "auth-source-search foo\nkept")))))
        (when (gethash handle emacs-devtools-mcp-spawn--handles)
          (ignore-errors (emacs-devtools-mcp-spawn-kill handle)))))))
 
@@ -2754,23 +2946,39 @@ many frames the runtime records."
     '(:selector "edmcp-no-such-ert-test-anywhere-42"))))
 
 (ert-deftest emacs-devtools-mcp-tests/describe-hooks-without-arg-lists-symbols ()
-  "Bare `describe-hooks' returns at least one well-known hook name."
+  "Bare `describe-hooks' returns a JSON-shaped plist, not a raw list.
+
+Regression: the no-arg branch previously returned a flat list of
+strings, which fell through `edmcp--server-wrap-content' to
+`jsonrpc--json-encode' and crashed with a non-keyword-key error.
+The handler now returns `(:hooks #(...))', and the `tools/call'
+encode path is exercised end-to-end here."
   :tags '(:fast)
-  (let ((res (edmcp--tools-describe-hooks '())))
-    (should (member "kill-emacs-hook" res))))
+  (let* ((res (edmcp--tools-describe-hooks '()))
+         (hooks (plist-get res :hooks)))
+    (should (vectorp hooks))
+    (should (seq-contains-p hooks "kill-emacs-hook"))
+    ;; The whole envelope must encode without error.  This is the
+    ;; regression check: previously the encode crashed.
+    (should (stringp (jsonrpc--json-encode
+                      (edmcp--server-wrap-content res))))))
 
 (ert-deftest emacs-devtools-mcp-tests/describe-hooks-with-name-returns-functions ()
-  "When HOOK is supplied, return its current contents."
+  "When HOOK is supplied, return its current contents as a vector.
+The `:functions' value must be a vector so `json-serialize' emits
+a JSON array; a plain list would be encoded as an alist/object."
   :tags '(:fast)
-  ;; `intern-soft' on the handler side requires the symbol to exist in
-  ;; the obarray; use `intern' so the lookup actually succeeds.
   (let* ((sym-name (format "edmcp-hook-fixture-%d" (random 100000)))
          (sym (intern sym-name)))
     (set sym '(some-fn another-fn))
     (unwind-protect
-        (let ((res (edmcp--tools-describe-hooks `(:hook ,sym-name))))
+        (let* ((res (edmcp--tools-describe-hooks `(:hook ,sym-name)))
+               (fns (plist-get res :functions)))
           (should (equal sym-name (plist-get res :name)))
-          (should (member "some-fn" (plist-get res :functions))))
+          (should (vectorp fns))
+          (should (seq-contains-p fns "some-fn"))
+          (should (stringp (jsonrpc--json-encode
+                            (edmcp--server-wrap-content res)))))
       (makunbound sym)
       (unintern sym nil))))
 
@@ -2818,6 +3026,79 @@ many frames the runtime records."
       (should (equal "ok"
                      (plist-get (aref (plist-get envelope :content) 0)
                                 :text))))))
+
+(ert-deftest emacs-devtools-mcp-tests/payload-cap-image-detected ()
+  "An envelope carrying an `image' content block is detected."
+  :tags '(:fast)
+  (let ((with-image (list :content
+                          (vector (list :type "text" :text "ok")
+                                  (list :type "image"
+                                        :data "Zm9v"
+                                        :mimeType "image/png"))
+                          :isError :json-false))
+        (text-only (list :content
+                         (vector (list :type "text" :text "ok"))
+                         :isError :json-false)))
+    (should (edmcp--server-envelope-has-image-p with-image))
+    (should-not (edmcp--server-envelope-has-image-p text-only))))
+
+(ert-deftest emacs-devtools-mcp-tests/payload-cap-image-uses-larger-cap ()
+  "An image envelope is sized against `max-image-response-bytes'.
+
+Regression: when both caps were the same knob (256 KiB default),
+a default-resolution screenshot's base64 always blew past the cap
+and `screenshot_frame' returned `payload_too_large' even on a
+working system.  The image cap now defaults to 8 MiB and is the
+one applied when an image block is present, so a 1 MiB screenshot
+passes through unchanged."
+  :tags '(:fast)
+  (let* ((emacs-devtools-mcp--tool-registry (make-hash-table :test 'equal))
+         (emacs-devtools-mcp-max-response-bytes 64)
+         (emacs-devtools-mcp-max-image-response-bytes (* 1 1024 1024))
+         ;; A ~4 KiB base64 string -- well over the 64-byte text cap, but
+         ;; well under the 1 MiB image cap.
+         (b64 (base64-encode-string (make-string 3000 ?x) t)))
+    (eval `(emacs-devtools-mcp-deftool fake-shot
+               "Returns a fake screenshot envelope."
+             :cost :fast
+             :read-only t
+             :handler (lambda (_p)
+                        (list :content
+                              (vector (list :type "image"
+                                            :data ,b64
+                                            :mimeType "image/png")))))
+          t)
+    (let ((envelope (edmcp--server-tools-call
+                     nil '(:name "fake_shot" :arguments nil))))
+      (should (eq :json-false (plist-get envelope :isError)))
+      (should (equal "image"
+                     (plist-get (aref (plist-get envelope :content) 0)
+                                :type))))))
+
+(ert-deftest emacs-devtools-mcp-tests/payload-cap-image-still-bounded ()
+  "Even the image cap is enforced; oversize image responses fail."
+  :tags '(:fast)
+  (let* ((emacs-devtools-mcp--tool-registry (make-hash-table :test 'equal))
+         (emacs-devtools-mcp-max-response-bytes 64)
+         (emacs-devtools-mcp-max-image-response-bytes 256)
+         (b64 (base64-encode-string (make-string 4096 ?x) t)))
+    (eval `(emacs-devtools-mcp-deftool fake-shot-huge
+               "Returns a too-big screenshot envelope."
+             :cost :fast
+             :read-only t
+             :handler (lambda (_p)
+                        (list :content
+                              (vector (list :type "image"
+                                            :data ,b64
+                                            :mimeType "image/png")))))
+          t)
+    (let ((envelope (edmcp--server-tools-call
+                     nil '(:name "fake_shot_huge" :arguments nil))))
+      (should (eq t (plist-get envelope :isError)))
+      (let ((text (plist-get (aref (plist-get envelope :content) 0) :text)))
+        (should (string-match-p "payload_too_large" text))
+        ;; The error mentions the image cap (256), not the text cap (64).
+        (should (string-match-p "256" text))))))
 
 ;;;; ___Keys___
 
@@ -3354,6 +3635,24 @@ many frames the runtime records."
     (should-error
      (edmcp--tools-screenshot-frame '()))))
 
+(ert-deftest emacs-devtools-mcp-tests/screenshot-too-large-message-is-area-shaped ()
+  "Oversize-frame error names pixel area, not WxH-vs-WxH.
+
+Regression: the old message read `Frame too large: 1920x1080
+exceeds cap 100x100', which compared two box dimensions even
+though the actual check was `(* w h) > cap'.  A 200x10 frame
+\(area 2000) compared favourably against the 100x100 cap on
+either dimension, but the message implied otherwise.  The new
+message reads `... = N pixels exceeds area cap M (= WxH; ...)' so
+the cap and the comparison both surface as areas."
+  :tags '(:fast)
+  (let ((emacs-devtools-mcp-tools-gui--host-backend 'x-export-frames)
+        (emacs-devtools-mcp-screenshot-max-pixels (cons 10 10)))
+    (let* ((err (should-error (edmcp--tools-screenshot-frame '())))
+           (msg (error-message-string err)))
+      (should (string-match-p "pixels" msg))
+      (should (string-match-p "area cap" msg)))))
+
 (ert-deftest emacs-devtools-mcp-tests/probe-host-backend-batch-is-unavailable ()
   "Backend probe in batch mode resolves to `unavailable'."
   :tags '(:fast)
@@ -3878,6 +4177,50 @@ it.  Caller is responsible for writing content to FILE."
       (should (equal 2 (plist-get (nth 0 positions) :line-end)))
       (should (equal 3 (plist-get (nth 1 positions) :line-start)))
       (should (equal 5 (plist-get (nth 1 positions) :line-end))))))
+
+(ert-deftest emacs-devtools-mcp-tests/init-bisect-form-positions-tolerates-footer ()
+  "A trailing `;;; foo.el ends here' footer parses cleanly.
+
+Regression: the parser previously treated trailing `;'-comments
+as parse-failure, since `read' raises `end-of-file' before
+returning, and the recovery path's `(eq beg (point-max))' check
+saw `beg' parked at the start of the comment.  Real-world init
+files that follow the package convention always have such a
+footer, so `bisect_init' refused to run on any of them."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-init-fixture (dir file)
+    (with-temp-file file
+      (insert ";;; init.el --- my config -*- lexical-binding:t; -*-\n"
+              "(setq foo 1)\n"
+              "(setq bar 2)\n"
+              "\n"
+              ";;; init.el ends here\n"))
+    (let ((positions (edmcp--tools-init-bisect-form-positions file)))
+      (should (= 2 (length positions)))
+      (should (equal 2 (plist-get (nth 0 positions) :line-start)))
+      (should (equal 3 (plist-get (nth 1 positions) :line-start))))))
+
+(ert-deftest emacs-devtools-mcp-tests/init-bisect-form-positions-tolerates-bare-footer ()
+  "A file ending mid-comment with no newline still parses cleanly."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-init-fixture (dir file)
+    (with-temp-file file
+      (insert "(setq a 1)\n(setq b 2)\n;;; eof"))
+    (let ((positions (edmcp--tools-init-bisect-form-positions file)))
+      (should (= 2 (length positions))))))
+
+(ert-deftest emacs-devtools-mcp-tests/init-bisect-form-positions-interleaved-comments ()
+  "Comment lines between forms do not change the form count."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-init-fixture (dir file)
+    (with-temp-file file
+      (insert ";; preamble\n"
+              "(setq a 1)\n"
+              ";; middle\n"
+              "(setq b 2)\n"
+              ";; trailing\n"))
+    (let ((positions (edmcp--tools-init-bisect-form-positions file)))
+      (should (= 2 (length positions))))))
 
 (ert-deftest emacs-devtools-mcp-tests/init-profile-redacts-frame-names ()
   "Frame strings inside `:top' are passed through `redact'."

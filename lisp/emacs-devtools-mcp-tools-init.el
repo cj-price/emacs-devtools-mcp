@@ -346,31 +346,47 @@ agent-influenced content host-side."
      (format "init file %s" file-real)
      (buffer-string))
     (goto-char (point-min))
-    (let ((positions nil)
-          (beg (point)))
-      (condition-case _done
-          (while t
-            (skip-chars-forward " \t\n\r")
-            (setq beg (point))
-            (let* ((form (read (current-buffer)))
-                   (end (point)))
-              (ignore form)
-              (push (list :line-start (line-number-at-pos beg)
-                          :line-end (line-number-at-pos end)
-                          :end-pos end)
-                    positions)))
-        (end-of-file
-         ;; Clean exit only if we ran out of input *between* forms.
-         ;; If `beg' is short of `point-max', `read' was mid-form and the
-         ;; file is unbalanced.
-         (unless (eq beg (point-max))
-           (signal 'emacs-devtools-mcp-init-error
-                   (list (format "cannot parse top-level forms in %s"
-                                 file-real)))))
-        (error (signal 'emacs-devtools-mcp-init-error
-                       (list (format "cannot parse top-level forms in %s"
-                                     file-real)))))
-      (nreverse positions))))
+    (cl-labels ((skip-noise ()
+                  ;; Skip whitespace and `;'-introduced line comments so
+                  ;; the parser tolerates a trailing `;;; foo.el ends here'
+                  ;; footer (and any other comment-only tail).
+                  (let (last)
+                    (while (not (equal last (point)))
+                      (setq last (point))
+                      (skip-chars-forward " \t\n\r")
+                      (when (eq (char-after) ?\;)
+                        (forward-line 1))))))
+      (let ((positions nil)
+            (clean-exit nil))
+        (condition-case _done
+            (while t
+              (skip-noise)
+              ;; Distinguish a clean exit (no more forms) from an
+              ;; unbalanced-parens parse failure: SET the flag *before*
+              ;; raising end-of-file ourselves, so the handler can tell
+              ;; which path got us there.  If `read' below raises
+              ;; end-of-file from inside an unbalanced form, the flag is
+              ;; still nil and the handler signals a parse error.
+              (when (eobp)
+                (setq clean-exit t)
+                (signal 'end-of-file nil))
+              (let* ((beg (point))
+                     (form (read (current-buffer)))
+                     (end (point)))
+                (ignore form)
+                (push (list :line-start (line-number-at-pos beg)
+                            :line-end (line-number-at-pos end)
+                            :end-pos end)
+                      positions)))
+          (end-of-file
+           (unless clean-exit
+             (signal 'emacs-devtools-mcp-init-error
+                     (list (format "cannot parse top-level forms in %s"
+                                   file-real)))))
+          (error (signal 'emacs-devtools-mcp-init-error
+                         (list (format "cannot parse top-level forms in %s"
+                                       file-real)))))
+        (nreverse positions)))))
 
 (defun edmcp--tools-init-bisect-write-prefix (file-real positions n)
   "Slice FILE-REAL using POSITIONS to keep its first N forms in a temp file.

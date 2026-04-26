@@ -24,6 +24,7 @@
 ;; Internal short alias: edmcp-- (this file only).
 
 (require 'cl-lib)
+(require 'seq)
 (require 'jsonrpc)
 (require 'emacs-devtools-mcp)
 (require 'emacs-devtools-mcp-rpc)
@@ -47,7 +48,19 @@ collision."
 (defcustom emacs-devtools-mcp-max-response-bytes (* 256 1024)
   "Hard cap on a single tool result's encoded JSON size, in bytes.
 Exceeding this yields a `payload_too_large' content envelope so the
-client always receives a structured error instead of a giant payload."
+client always receives a structured error instead of a giant payload.
+Image-bearing responses use `emacs-devtools-mcp-max-image-response-bytes'
+instead, since base64-encoded screenshots routinely exceed 256 KiB."
+  :type 'natnum
+  :group 'emacs-devtools-mcp-tools
+  :package-version '(emacs-devtools-mcp . "0.1.0"))
+
+(defcustom emacs-devtools-mcp-max-image-response-bytes (* 8 1024 1024)
+  "Hard cap, in bytes, for tool responses that include an MCP `image' block.
+A 1080p PNG screenshot at default resolution base64-encodes to
+~2--3 MiB; the 256 KiB text cap would refuse those by default,
+making `screenshot-frame' unusable.  Applies whenever any element
+of the response's `:content' vector has `:type \"image\"'."
   :type 'natnum
   :group 'emacs-devtools-mcp-tools
   :package-version '(emacs-devtools-mcp . "0.1.0"))
@@ -442,18 +455,40 @@ re-encoded by `json-serialize' (which rejects unibyte strings)."
                                'utf-8)))
           :isError :json-false))))
 
-(defun edmcp--server-too-large-p (envelope)
-  "Return non-nil if ENVELOPE's encoded form exceeds the response cap."
-  (> (string-bytes (jsonrpc--json-encode envelope))
-     emacs-devtools-mcp-max-response-bytes))
+(defun edmcp--server-envelope-has-image-p (envelope)
+  "Return non-nil if ENVELOPE's `:content' vector includes an image block.
+An image block is any element whose `:type' is the string
+`image' -- the standard MCP content block for binary data."
+  (let ((content (plist-get envelope :content)))
+    (and (vectorp content)
+         (seq-some (lambda (block)
+                     (and (listp block)
+                          (equal (plist-get block :type) "image")))
+                   content))))
 
-(defun edmcp--server-payload-too-large-envelope ()
-  "Return the canonical `payload_too_large' tool-result envelope."
+(defun edmcp--server-response-cap (envelope)
+  "Return the byte cap to apply to ENVELOPE.
+Image-bearing envelopes use the larger image cap; everything else
+uses the standard response cap."
+  (if (edmcp--server-envelope-has-image-p envelope)
+      emacs-devtools-mcp-max-image-response-bytes
+    emacs-devtools-mcp-max-response-bytes))
+
+(defun edmcp--server-too-large-p (envelope)
+  "Return non-nil if ENVELOPE's encoded form exceeds its applicable cap."
+  (> (string-bytes (jsonrpc--json-encode envelope))
+     (edmcp--server-response-cap envelope)))
+
+(defun edmcp--server-payload-too-large-envelope (cap)
+  "Return the canonical `payload_too_large' tool-result envelope.
+CAP is the byte cap that the over-cap envelope exceeded; it is
+formatted into the human-readable error text so an agent can see
+which cap (text or image) it tripped."
   (list :content
         (vector
          (list :type "text"
                :text (format "payload_too_large: result exceeds %d bytes"
-                             emacs-devtools-mcp-max-response-bytes)))
+                             cap)))
         :isError t))
 
 (defun edmcp--server-tools-call (_conn params)
@@ -500,7 +535,8 @@ JSON-RPC error code."
                                       :text (error-message-string err)))
                         :isError t)))))
           (if (edmcp--server-too-large-p envelope)
-              (edmcp--server-payload-too-large-envelope)
+              (edmcp--server-payload-too-large-envelope
+               (edmcp--server-response-cap envelope))
             envelope)))))))
 
 (defun emacs-devtools-mcp-server-default-dispatcher (conn method params)

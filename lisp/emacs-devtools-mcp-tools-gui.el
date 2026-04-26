@@ -372,8 +372,10 @@ block, or signals when no working backend is available."
     (unless (eq backend 'x-export-frames)
       (error "Screenshot backend unavailable: %s" backend))
     (when (> (* pw ph) cap)
-      (error "Frame too large: %dx%d exceeds cap %dx%d (configure %s)"
-             pw ph
+      (error (concat "Frame too large: %dx%d = %d pixels exceeds area cap "
+                     "%d (= %dx%d; configure %s)")
+             pw ph (* pw ph)
+             cap
              (car emacs-devtools-mcp-screenshot-max-pixels)
              (cdr emacs-devtools-mcp-screenshot-max-pixels)
              'emacs-devtools-mcp-screenshot-max-pixels))

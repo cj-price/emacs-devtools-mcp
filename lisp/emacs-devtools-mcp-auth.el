@@ -143,16 +143,17 @@ so per-repo fixtures load without editing the allowlist."
 
 (defun emacs-devtools-mcp-auth-validate-init-path (path)
   "Return PATH's truename iff PATH is under the init allowlist.
-Signal `user-error' otherwise.  PATH is resolved via
-`file-truename' before the prefix check, so a symlink pointing
-outside the allowlist is rejected even when its containing
-directory is allowed."
+Signal `user-error' otherwise.  Accepts when *either* the expanded
+form or the symlink-resolved truename matches a prefix, so a
+NixOS-style symlink from `~/.config/emacs/init.el' into
+`/nix/store' is allowed."
   (let* ((abs (expand-file-name path))
          (real (and (file-exists-p abs) (file-truename abs))))
     (unless real
       (user-error "Init file does not exist: %s" path))
     (let ((prefixes (edmcp--auth-allowlist-prefixes)))
-      (unless (cl-some (lambda (p) (string-prefix-p p real)) prefixes)
+      (unless (or (cl-some (lambda (p) (string-prefix-p p abs)) prefixes)
+                  (cl-some (lambda (p) (string-prefix-p p real)) prefixes))
         (user-error "Init path %s outside allowlist (%s)"
                     real
                     (if prefixes

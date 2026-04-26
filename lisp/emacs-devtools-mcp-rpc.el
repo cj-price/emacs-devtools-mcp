@@ -41,9 +41,11 @@
 Used for both the per-launch auth token and pagination cursor
 identifiers.  Reads through `head -c N-BYTES /dev/urandom' because
 `insert-file-contents-literally' silently returns zero bytes on
-character devices when given a BEG/END range.  Falls back to
-`random' (with a warning) only if the subprocess fails or returns
-short -- on Linux/BSD/macOS the primary path always succeeds."
+character devices when given a BEG/END range.  Falls back silently
+to `random' only if the subprocess fails or returns short -- on
+Linux/BSD/macOS the primary path always succeeds, and the
+fallback is correctness-equivalent (only the entropy source
+weakens), so a *Warnings* entry on every fallback was pure noise."
   (or (ignore-errors
         (with-temp-buffer
           (set-buffer-multibyte nil)
@@ -54,22 +56,25 @@ short -- on Linux/BSD/macOS the primary path always succeeds."
                  (bytes (buffer-string)))
             (when (and (eq rc 0) (= (length bytes) n-bytes))
               (mapconcat (lambda (b) (format "%02x" b)) bytes "")))))
-      (progn
-        (display-warning
-         'emacs-devtools-mcp
-         "/dev/urandom unavailable; falling back to (random) for tokens"
-         :warning)
-        (let ((s (make-string n-bytes 0)))
-          (dotimes (i n-bytes) (aset s i (random 256)))
-          (mapconcat (lambda (b) (format "%02x" b)) s "")))))
+      (let ((s (make-string n-bytes 0)))
+        (dotimes (i n-bytes) (aset s i (random 256)))
+        (mapconcat (lambda (b) (format "%02x" b)) s ""))))
 
 (defconst emacs-devtools-mcp--default-redact-regexps
-  '("auth-source-" "epg-" "tramp-")
+  '("^[ \t(]*auth-source-"
+    "^[ \t(]*epg-"
+    "^[ \t(]*tramp-")
   "Built-in line-match patterns dropped before output reaches the wire.
-These targets are commonly source of secrets or noisy debug
-output.  Customize via `emacs-devtools-mcp-redact-extra-regexps'
-to add project-specific patterns; you cannot disable the default
-set by design.")
+These targets are commonly a source of secrets or noisy debug
+output.  Patterns require the prefix to be the first significant
+token on the line, modulo leading whitespace and an optional open
+paren -- so `auth-source-search: ...' is scrubbed,
+`(auth-source-search ...)' is scrubbed, and a backtrace frame
+`  (auth-source-search ...)' is scrubbed.  A line that merely
+mentions one of the prefixes mid-token, e.g.\\ a frame named
+`my-pkg-call-auth-source-foo', passes through.  Customize via
+`emacs-devtools-mcp-redact-extra-regexps' to add project-specific
+patterns; you cannot disable the default set by design.")
 
 (defcustom emacs-devtools-mcp-redact-extra-regexps nil
   "Additional regexps whose matching lines are stripped from text output.

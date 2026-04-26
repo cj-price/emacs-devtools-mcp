@@ -193,12 +193,31 @@ Polls every 100 ms up to `emacs-devtools-mcp-spawn-ready-timeout'."
                               server-name
                               emacs-devtools-mcp-spawn-ready-timeout))))))
 
+(defun edmcp--spawn-bootstrap-args ()
+  "Return argv prefix to load this package into a fresh `emacs -Q' daemon.
+Without this prefix, `emacsclient --eval' calls from the host
+that reference `emacs-devtools-mcp-tools-*' functions fail with
+`void-function', since `-Q' skips both `init.el' and the default
+`package.el' `load-path' injection."
+  (let ((dir (file-name-directory
+              (or (locate-library "emacs-devtools-mcp")
+                  (signal 'emacs-devtools-mcp-spawn-error
+                          (list (concat "cannot bootstrap subordinate "
+                                        "Emacs: emacs-devtools-mcp not on "
+                                        "load-path")))))))
+    (list "-L" dir
+          "--eval" "(require 'emacs-devtools-mcp)"
+          "--eval" "(require 'emacs-devtools-mcp-server)")))
+
 (defun edmcp--spawn-start-bg-daemon (server-name extra-args)
   "Run `emacs -Q --bg-daemon=SERVER-NAME EXTRA-ARGS' synchronously.
 The daemon detaches; the parent exits as soon as the fork
 succeeds.  We then call `edmcp--spawn-wait-ready' to confirm the
-daemon is accepting clients.  Returns the daemon PID."
+daemon is accepting clients.  Returns the daemon PID.  Injects
+the bootstrap argv between the daemon flag and EXTRA-ARGS so the
+package is loaded before any user `-l INIT' runs."
   (let* ((cmd-args (append (list "-Q" (format "--bg-daemon=%s" server-name))
+                           (edmcp--spawn-bootstrap-args)
                            extra-args))
          (res (edmcp--spawn-call-process
                emacs-devtools-mcp-spawn-emacs-program cmd-args)))
