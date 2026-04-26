@@ -17,3 +17,6 @@ manual/dir
 # Test artifacts
 /test/tmp/
 /test/*.log
+
+# Local Claude Code state
+/.claude/

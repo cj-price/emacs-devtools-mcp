@@ -112,15 +112,18 @@ Define every tool with the package's macro:
   :read-only nil
   :destructive t
   :idempotent nil
-  :schema '(:type "object"
+  :schema `(:type "object"
             :properties ((form         . (:type "string"))
-                         (print_level  . (:type ("integer" "null")))
-                         (print_length . (:type ("integer" "null")))
-                         (target       . (:oneOf ((:type "object" :properties ((host  . (:const t))))
-                                                  (:type "object" :properties ((spawn . (:type "string"))))))))
-            :required ("form"))
+                         (print_level  . (:type ["integer" "null"]))
+                         (print_length . (:type ["integer" "null"]))
+                         (target       . ,emacs-devtools-mcp-target-schema))
+            :required ["form"])
   :handler #'emacs-devtools-mcp-tools-eval--elisp)
 ```
+
+**Schema is a backquoted form, not a quoted datum.** The macro expands `:schema ,schema` (unquoted), so the schema value is *evaluated* at definition time. Use a backquote (`` ` ``) to splice constants like `,emacs-devtools-mcp-target-schema` (the canonical host/spawn `:oneOf`). A bare `'(:type "object")` is acceptable for trivial schemas, but production tools should backquote and reuse the `target-schema` constant for the `:target` field. **Do not** write the schema as raw `(:type "object" …)` — that becomes a function call at expansion.
+
+**Schema array convention**: every JSON array — values of `:required`, `:enum`, `:oneOf`, multi-valued `:type` — must be written as an Elisp **vector** (`["a" "b"]`), not a list. `json-serialize` only treats vectors as JSON arrays; lists are interpreted as alists (objects) and fail to encode for arrays-of-strings. The validator coerces both forms via `edmcp--as-list`, so reading is uniform.
 
 The macro:
 - Registers `name → record` in the central tool table.
@@ -128,7 +131,6 @@ The macro:
 - Emits MCP `readOnlyHint`/`destructiveHint`/`idempotentHint` in `tools/list`.
 - Wraps the handler in `condition-case` → error envelope.
 - For `:cost :slow`: wraps body in `(while-no-input (with-timeout (T (...)) ...))` so user keystrokes preempt.
-- Generates an interactive `;;;###autoload` wrapper **only** when explicitly requested (`:interactive t`).
 
 A handler **must** end with `(emacs-devtools-mcp-spawn-call target form)` — never branch on `target`. One code path for host vs spawn.
 

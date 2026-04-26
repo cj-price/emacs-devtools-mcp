@@ -64,7 +64,7 @@ test-gui: lisp
 	  --eval '(ert-run-tests-batch-and-exit (quote (tag :gui)))'
 
 test-mcp:
-	@echo "test-mcp not implemented yet (story 030)" && exit 0
+	$(TEST_DIR)/e2e-smoke.sh
 
 lint:
 	@for f in $(LISP_SRC); do \

@@ -1,3 +1,44 @@
-## Unreleased
+## 0.1.0 — 2026-04-25
 
-Project scaffolding only — no user-visible features yet.
+Initial release.  v1 tool surface complete: 36 tools across 8 categories.
+
+### Server
+
+* Newline-delimited JSON-RPC over a Unix socket at
+  `${XDG_RUNTIME_DIR}/edmcp/${NAME}.sock` (mode `0600`).
+* Subclassed `jsonrpc-connection` for MCP-correct framing.
+* `SO_PEERCRED` uid check + per-launch token in the first MCP frame.
+* Stale-socket detection (`S_ISSOCK`, same-uid, non-symlink).
+* Single in-flight slot; `:slow` tools wrapped in `while-no-input` +
+  `with-timeout`.
+* Cursor-based pagination with TTL'd server-side state.
+* Output redaction layer for `auth-source-`/`epg-`/`tramp-` lines plus
+  user-supplied regexps.
+
+### Tools
+
+* **Server**: `ping`.
+* **Spawn**: `spawn_emacs`, `attach_emacs`, `list_handles`, `kill_emacs`.
+* **Eval / debug**: `eval_elisp`, `edebug_instrument`,
+  `edebug_uninstrument`, `capture_backtrace`, `trace_function`,
+  `untrace_function`, `trace_log`.
+* **Buffer / state**: `list_buffers`, `buffer_state`, `buffer_substring`,
+  `list_messages`, `list_warnings`, `ert_run`, `describe_hooks`.
+* **Keys**: `where_is`, `lookup_key`, `describe_keymap`, `simulate_keys`,
+  `key_translation_trace`.
+* **GUI**: `screenshot_frame`, `get_frame_tree`, `face_at`,
+  `describe_face`, `list_faces`, `color_contrast`.
+* **Init**: `init_lint`, `startup_profile`, `bisect_init`.
+
+### Tests
+
+* 263 ERT tests, tagged `:fast` / `:daemon` / `:fresh-daemon` / `:gui`.
+* Property tests for color-contrast, RPC round-trip, schema validator,
+  redaction, lint-line classification.
+* Real-process daemon fixtures; no mocks of Emacs / emacsclient / sockets.
+
+### Build
+
+* `make all | lisp | test | test-fast | test-daemon | test-gui |
+  test-mcp | lint | manual | clean`.
+* CI matrix: Emacs 29.1, 29.4, 30.1.

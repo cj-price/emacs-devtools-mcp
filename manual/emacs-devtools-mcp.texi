@@ -21,7 +21,7 @@ Software Foundation; either version 3, or (at your option) any later version.
 
 @titlepage
 @title emacs-devtools-mcp
-@subtitle An MCP server for introspecting and debugging Emacs from a coding agent
+@subtitle An MCP server for introspecting Emacs from a coding agent
 @author C.J. Price
 @page
 @vskip 0pt plus 1filll
@@ -35,14 +35,25 @@ Software Foundation; either version 3, or (at your option) any later version.
 @top emacs-devtools-mcp
 
 This manual describes @code{emacs-devtools-mcp}, a Model Context Protocol
-server that runs inside Emacs and lets a coding agent inspect frames,
-keymaps, faces, buffers, and init.el.
-
-This is a pre-alpha skeleton; sections will be filled in as tool stories
-land.
+server that runs inside Emacs and lets a coding agent introspect frames,
+windows, buffers, faces, keymaps, hooks, advice, the message log, the
+@samp{*Warnings*} buffer, and your @file{init.el}.  Version
+0.1.0.
 
 @menu
-* Introduction::
+* Introduction::                 What this package is and is not.
+* Installation::                 Installing and registering with an agent.
+* Architecture::                 Transport, dispatch, and the spawn target.
+* Conventions::                  Targets, cursors, JSON keys, error envelopes.
+* Server tools::                 @code{ping}.
+* Spawn tools::                  Subordinate Emacs lifecycle.
+* Eval and debug tools::         @code{eval_elisp}, edebug, backtrace, trace.
+* Buffer tools::                 Buffers, messages, warnings, ERT, hooks.
+* Key tools::                    @code{where-is}, @code{lookup-key}, simulate.
+* GUI tools::                    Screenshots, frame tree, faces, contrast.
+* Init tools::                   @code{init_lint}, profile, bisect.
+* Configuration::                Customization variables.
+* Security::                     Threat model and what is defended.
 * Index::
 @end menu
 @end ifnottex
@@ -55,6 +66,561 @@ land.
 chrome-devtools-mcp} does for Chrome: give an LLM-driven coding agent a
 structured set of tools for inspecting state, exercising input, and
 verifying that changes actually rendered.
+
+The server runs @emph{inside} the user's Emacs session as an Elisp package
+and exposes Model Context Protocol (MCP) tools over a Unix-domain socket.
+A small POSIX-sh relay (@file{bin/emacs-devtools-mcp}) bridges between the
+agent's stdio MCP transport and the socket.  Tools that need a clean Emacs
+to experiment in --- bisecting an @file{init.el}, running a startup
+profile, or testing under @code{emacs -Q} --- can target a subordinate
+Emacs daemon spawned via @code{spawn_emacs}.
+
+This manual is the reference.  See @file{README.md} in the source tree for
+the quickstart and a usage transcript.
+
+@node Installation
+@chapter Installation
+
+@section Requirements
+
+@itemize @bullet
+@item GNU Emacs 29.1 or newer.
+@item @command{socat} and @command{jq} on @env{PATH}.
+@item For headless / GUI tests: @command{xvfb-run} and @command{grim}.
+@end itemize
+
+The repository ships a @file{shell.nix} that pins all of the above.
+
+@section From source
+
+@example
+git clone https://github.com/cjprice/emacs-devtools-mcp.git
+cd emacs-devtools-mcp
+nix-shell --run 'make all'
+@end example
+
+@section Loading the server
+
+@example
+(add-to-list 'load-path "/path/to/emacs-devtools-mcp/lisp")
+(require 'emacs-devtools-mcp)
+(require 'emacs-devtools-mcp-server)
+(emacs-devtools-mcp-server-start)
+@end example
+
+@code{emacs-devtools-mcp-server-start} binds a Unix socket at
+@file{$XDG_RUNTIME_DIR/edmcp/$NAME.sock}, where @code{$NAME} comes from
+@code{emacs-devtools-mcp-server-name} (default @code{"default"}).  It hard
+fails if @env{XDG_RUNTIME_DIR} is unset.  @code{emacs-devtools-mcp-server-stop}
+shuts the listener down and removes the socket and token sibling file.
+
+@section Registering with Claude Code
+
+Copy @file{.mcp.json.example} to a project's @file{.mcp.json} (or to your
+global Claude Code config) and edit the @code{command} field to the
+absolute path of @file{bin/emacs-devtools-mcp}:
+
+@example
+@{
+  "mcpServers": @{
+    "emacs-devtools": @{
+      "command": "/abs/path/to/emacs-devtools-mcp/bin/emacs-devtools-mcp",
+      "env": @{ "EDMCP_NAME": "default" @}
+    @}
+  @}
+@}
+@end example
+
+The agent's first frame (the @code{initialize} request) is rewritten by the
+relay to carry the per-launch token from
+@file{$XDG_RUNTIME_DIR/edmcp/$NAME.token}.
+
+@node Architecture
+@chapter Architecture
+
+@example
+agent --stdio--> bin/emacs-devtools-mcp --unix socket--> Host Emacs
+   newline-delimited JSON-RPC                                |
+   per the MCP stdio spec                                    |
+                                                             v
+                                       make-process argv list
+                                                             |
+                                                             v
+                                       Subordinate Emacs (`emacs -Q --bg-daemon')
+                                       (optionally under `xvfb-run')
+@end example
+
+@itemize @bullet
+@item
+@strong{Transport}.  MCP stdio is newline-delimited JSON.  The package
+subclasses the abstract @code{jsonrpc-connection} from @code{jsonrpc.el}
+and supplies newline framing, keeping the dispatch / continuation
+machinery.  (The built-in @code{jsonrpc-process-connection} uses
+Content-Length framing and is therefore wrong for MCP.)
+
+@item
+@strong{Concurrency}.  Single in-flight slot per server.  Tools tagged
+@code{:fast} or @code{:slow}; @code{:slow} runs inside @code{while-no-input}
++ @code{with-timeout} so user keystrokes preempt them.  A second
+@code{:slow} request returns a @code{busy} envelope.
+
+@item
+@strong{Spawn target}.  Subordinate Emacs is launched with
+@code{--bg-daemon=NAME}; @code{emacsclient -s NAME --eval} is the call
+boundary.  Replies are parsed under @code{(let ((read-eval nil)) (read
+@dots{})}) so a malicious @code{#.} reader-macro in subordinate output
+cannot execute code in the host.
+@end itemize
+
+@node Conventions
+@chapter Conventions
+
+@section The @code{target} parameter
+
+Every tool accepts an optional @code{target} object:
+
+@example
+@{ "host":  true @}              ;; default --- the user's Emacs
+@{ "spawn": "<handle>" @}        ;; a subordinate started by `spawn_emacs'
+@end example
+
+@noindent
+@code{target} is always an object.  Bare strings are not accepted.
+
+@section Cursors
+
+List-shaped tools (@code{list_buffers}, @code{list_faces},
+@code{describe_keymap}, @code{describe_hooks}, @code{list_handles},
+@code{list_messages}, @code{list_warnings}, @code{trace_log}) take an
+optional @code{cursor} string and return @code{next_cursor} when more
+results remain.  Pass that opaque string back as @code{cursor} to continue.
+Cursor state is held server-side, keyed by random 16-byte hex token, with
+a 5-minute TTL.
+
+@section JSON keys
+
+All wire keys are @code{snake_case}: @code{server_name},
+@code{print_level}, @code{max_bytes}, @code{next_cursor}.  Internal Elisp
+identifiers stay kebab-case; the registration macro maps between them.
+
+@section Error envelopes
+
+Two distinct failure shapes:
+
+@itemize @bullet
+@item
+@strong{Protocol failures} --- unknown tool, schema-invalid arguments ---
+return a JSON-RPC @code{error} object with code @code{-32601} (method not
+found) or @code{-32602} (invalid params).
+@item
+@strong{Tool execution failures} --- @code{eval} signal, buffer not found,
+allowlist violation, payload too large --- return a successful response
+with @code{isError: true} plus an MCP content block describing the
+failure.  The wire form for false in JSON is @code{:json-false}; agents
+should test for truthiness explicitly.
+@end itemize
+
+@section Tool annotations
+
+Every tool exposes MCP @code{readOnlyHint}, @code{destructiveHint}, and
+@code{idempotentHint} on @code{tools/list}.  Agents that respect these
+hints can plan accordingly: @code{init_lint} is read-only and idempotent,
+while @code{bisect_init} is destructive (executes user code in
+subprocesses) and not idempotent (the predicate may have side effects).
+
+@node Server tools
+@chapter Server tools
+
+@deffn Tool ping &key message target
+Smoke-test tool: replies with @code{"pong"}, optionally echoing
+@code{message} verbatim.  Read-only and idempotent.
+
+Example:
+
+@example
+@{ "name": "ping", "arguments": @{ "message": "hi" @} @}
+=> @{ "pong": "hi" @}
+@end example
+@end deffn
+
+@node Spawn tools
+@chapter Spawn tools
+
+The spawn subsystem manages subordinate @code{emacs -Q --bg-daemon}
+processes.  Handles are random opaque strings; the daemon's
+@code{server-name} is auto-generated as @code{edmcp-spawn-<HANDLE>} and is
+not caller-controllable, which prevents an agent from colliding with a
+daemon owned by the user.
+
+@deffn Tool spawn_emacs &key init headless target
+Spawn a subordinate Emacs daemon and return its handle.  @code{init} is
+optional; when set it must lie under
+@code{emacs-devtools-mcp-init-allowlist}.  @code{headless} is reserved for
+Xvfb-backed mode and is currently rejected.  Returns
+@code{@{handle, server_name, pid, expires_at@}}.  Destructive.
+@end deffn
+
+@deffn Tool attach_emacs &key server_name target
+Register an externally started daemon by @code{server_name}.  Probes the
+daemon before recording the handle; signals if no daemon answers.
+@code{server_name} is validated against @code{[A-Za-z0-9_-]+}.  Destructive.
+@end deffn
+
+@deffn Tool list_handles &key cursor target
+List active handles, paginated.  Each entry includes @code{idle_seconds}
+and @code{expires_at} so an agent can plan around the idle reaper.
+Read-only and idempotent.
+@end deffn
+
+@deffn Tool kill_emacs &key handle target
+Kill the daemon at @code{handle} and forget the handle.  Destructive but
+idempotent: killing an unknown handle returns OK rather than signalling.
+@end deffn
+
+@node Eval and debug tools
+@chapter Eval and debug tools
+
+@deffn Tool eval_elisp &key form print_level print_length target
+Evaluate @code{form} in @code{target} and return its printed value, the
+@samp{*Messages*} delta, and any error.  Output is redacted to drop lines
+mentioning auth-source / epg / tramp before transit.  Destructive.
+
+Example:
+
+@example
+@{ "name": "eval_elisp",
+  "arguments": @{ "form": "(+ 1 2)" @} @}
+=> @{ "value": "3", "messages": [], "error": null @}
+@end example
+@end deffn
+
+@deffn Tool edebug_instrument &key function target
+@deffnx Tool edebug_uninstrument &key function target
+Instrument @code{function} for edebug, or remove instrumentation.  The
+original @code{symbol-function} value is recorded so re-uninstrument does
+not require re-reading source.  Destructive but idempotent.
+@end deffn
+
+@deffn Tool capture_backtrace &key form target
+Evaluate @code{form} and return any signaled backtrace.  A
+@code{signal-hook-function} captures the live frame stack at signal time,
+so the trace reflects the point of failure rather than the point where the
+package's @code{condition-case} caught.  Output is tail-truncated at
+@code{emacs-devtools-mcp-backtrace-max-bytes} and redacted.  Destructive.
+@end deffn
+
+@deffn Tool trace_function &key function buffer target
+@deffnx Tool untrace_function &key function target
+@deffnx Tool trace_log &key buffer cursor target
+@code{trace-function-foreground} round-trip.  @code{trace_log} returns the
+lines of the trace buffer (default @code{trace-buffer}), paginated and
+redacted.  @code{trace_function}/@code{untrace_function} are destructive
+and idempotent.  @code{trace_log} is read-only and idempotent.
+@end deffn
+
+@node Buffer tools
+@chapter Buffer tools
+
+@deffn Tool list_buffers &key filter cursor target
+List live buffers, optionally narrowed by regex @code{filter}.  Read-only
+and idempotent.
+@end deffn
+
+@deffn Tool buffer_state &key buffer target
+Return point/mark/mode/file metadata for @code{buffer}.
+@end deffn
+
+@deffn Tool buffer_substring &key buffer start end with_properties max_bytes target
+Return up to @code{max_bytes} of @code{buffer} between @code{start} and
+@code{end}.  Sets @code{truncated: true} and @code{next_offset} when the
+cap is hit, so an agent can stream the rest with follow-up calls.  When
+@code{with_properties} is true, the returned text includes a
+@code{properties} array describing text properties.
+@end deffn
+
+@deffn Tool list_messages &key n cursor target
+Return the last @code{n} lines of @samp{*Messages*}, redacted.
+@end deffn
+
+@deffn Tool list_warnings &key cursor target
+Return the contents of @samp{*Warnings*}, paragraph-split.
+@end deffn
+
+@deffn Tool ert_run &key selector target
+Run ERT for @code{selector} (default: all tests) and return a summary
+plist with pass/fail counts and per-test detail for failures.  Destructive.
+@end deffn
+
+@deffn Tool describe_hooks &key hook cursor target
+List all bound hooks, or the contents of a specific @code{hook}.
+@end deffn
+
+@node Key tools
+@chapter Key tools
+
+@deffn Tool where_is &key command keymap target
+Return all key sequences bound to @code{command} in @code{keymap}
+(default: global).
+@end deffn
+
+@deffn Tool lookup_key &key keys keymap accept_default target
+Return the command bound to @code{keys} in @code{keymap}.
+@end deffn
+
+@deffn Tool describe_keymap &key keymap_or_mode prefix cursor target
+List flattened bindings under @code{keymap_or_mode}, optionally narrowed
+by @code{prefix}.
+@end deffn
+
+@deffn Tool simulate_keys &key keys buffer target
+Run @code{keys} as a @code{kbd} macro in @code{buffer} and return the
+state delta: @code{last_command}, @code{this_command}, @code{point},
+@code{mark}, @code{buffer_diff}, @code{messages}.  Text-cap-checked
+against @code{emacs-devtools-mcp-keys-simulate-text-cap}.  Destructive.
+@end deffn
+
+@deffn Tool key_translation_trace &key keys target
+Trace @code{keys} through @code{input-decode-map},
+@code{local-function-key-map}, and @code{key-translation-map}, returning
+the input/output of each stage.
+@end deffn
+
+@node GUI tools
+@chapter GUI tools
+
+@deffn Tool screenshot_frame &key frame format target
+Export @code{frame} (default: selected frame) to a base64-encoded PNG and
+return it as an MCP @code{image} content block (@code{@{type: "image",
+data, mimeType@}}).  Returns a structured error when no display backend
+is available.  The frame's pixel dimensions must fit within
+@code{emacs-devtools-mcp-screenshot-max-pixels}; otherwise the image is
+downscaled before encoding.
+
+A backend probe at server-start picks between @code{x-export-frames},
+@command{grim} (Wayland), and @command{xwd} (X11).  The result is cached
+in @code{emacs-devtools-mcp-tools-gui--host-backend}.  The spawn target
+always uses @code{x-export-frames} (the Xvfb daemon is X11).
+@end deffn
+
+@deffn Tool get_frame_tree &key frame target
+Return frames @math{->} windows @math{->} buffer metadata for the
+selected display.
+@end deffn
+
+@deffn Tool face_at &key buffer line column target
+Return the face at @code{line} (1-based) and @code{column} (0-based) of
+@code{buffer}.
+@end deffn
+
+@deffn Tool describe_face &key name target
+Return inheritance-resolved attributes and docstring for face @code{name}.
+@end deffn
+
+@deffn Tool list_faces &key filter cursor target
+List all face symbols in alphabetical order, optionally narrowed by
+@code{filter} (regex).
+@end deffn
+
+@deffn Tool color_contrast &key foreground background target
+Compute the WCAG contrast ratio between @code{foreground} and
+@code{background}.  Pure math; identical results host vs.@: spawn.
+@end deffn
+
+@node Init tools
+@chapter Init tools
+
+@strong{Caveat.}  These tools execute the user's real @file{init.el} in
+subordinate @code{emacs -Q --batch} subprocesses that inherit the user's
+@env{HOME} and the rest of the environment.  Anything the init file does
+on disk (creates files, mutates state, contacts the network) will happen
+during a probe.  The host Emacs is unaffected because subordinates are
+batch processes, but the user's filesystem is not.
+
+@deffn Tool init_lint &key file target
+Byte-compile @code{file} in @code{emacs -Q --batch} and report
+diagnostics.  @code{file} defaults to @code{user-init-file} (or the XDG
+path) and is allowlist-checked before execution.  The compiled output
+goes to a temp directory and is discarded --- this tool does not modify
+the user's config tree.  Read-only and idempotent.
+
+Returns a plist with @code{file}, @code{exit_code}, @code{warnings},
+@code{errors}, @code{ok}, and the redacted @code{raw} subprocess output.
+@end deffn
+
+@deffn Tool startup_profile &key file target
+Run @code{file} under the CPU profiler in @code{emacs -Q --batch}.
+Returns @code{elapsed} seconds plus the top 50 hotspot frames from
+@code{profiler-cpu-log}, with frame strings passed through the redaction
+layer.  Destructive (loads user code), not idempotent (profiler sampling
+is wall-clock dependent).
+
+Includes a @code{parse_error} flag set when the sentinel pair printed by
+the wrapper isn't found in subprocess output --- this guards against an
+@file{init.el} that prints fake sentinels of its own.
+@end deffn
+
+@deffn Tool bisect_init &key file predicate target
+Binary-search @code{file} for the form that triggers @code{predicate}.
+@code{predicate} is a Lisp form (string) that returns non-nil iff the
+problem reproduces.  Each probe is one @code{emacs -Q --batch}
+subprocess loading a prefix of @code{file}.  Returns the 1-based
+@code{culprit_form} index plus its @code{line_start}/@code{line_end} and
+a @code{load_failed_probes} counter that flags when convergence was
+driven by load-time crashes rather than predicate hits.
+
+Bisection assumes @code{predicate} is monotonic over prefixes of the
+init file --- if the agent supplies a non-monotonic predicate (one that
+toggles, depends on wall-clock, etc.), the result is undefined.  This is
+why the tool advertises @code{idempotentHint: false}: even successful
+runs may produce different culprits on repeated invocation.
+
+The path is allowlist-checked.  Predicate errors are caught and treated
+as @emph{non-reproducing} so that a buggy predicate cannot pin to an
+arbitrary form.  The predicate string and the init file are both rejected
+if they contain a reader macro (@code{#.} or @code{#@@}).
+@end deffn
+
+@node Configuration
+@chapter Configuration
+
+All knobs are @code{defcustom}s under one of four groups:
+
+@itemize @bullet
+@item @code{emacs-devtools-mcp} --- parent.
+@item @code{emacs-devtools-mcp-server} --- transport, dispatch, lifecycle.
+@item @code{emacs-devtools-mcp-spawn} --- subordinate Emacs.
+@item @code{emacs-devtools-mcp-tools} --- per-category tool defaults.
+@item @code{emacs-devtools-mcp-security} --- auth, redaction, allowlist.
+@end itemize
+
+@noindent
+@code{M-x customize-group RET emacs-devtools-mcp RET} walks the full set.
+
+@defopt emacs-devtools-mcp-server-name
+Socket name segment under @file{$XDG_RUNTIME_DIR/edmcp/}.  Default
+@code{"default"}.  Multiple Emacsen can each run a server with a different
+name without colliding.
+@end defopt
+
+@defopt emacs-devtools-mcp-init-allowlist
+Directories from which @code{init_lint}, @code{startup_profile},
+@code{bisect_init}, and @code{spawn_emacs} may load init files.  Default:
+@file{~/.config/emacs}, @file{~/.emacs.d}, project root.  Paths are
+expanded via @code{expand-file-name} + @code{file-truename} before
+prefix-matching.
+@end defopt
+
+@defopt emacs-devtools-mcp-max-response-bytes
+Global hard cap on per-call response payload, in bytes.  Default
+@code{262144}.  Exceeding it returns a @code{payload_too_large} tool-error
+envelope.
+@end defopt
+
+@defopt emacs-devtools-mcp-screenshot-max-pixels
+Maximum pixel count for screenshot exports.  Default 1920@math{x}1080
+(@code{2073600}).  Larger frames are downscaled before encoding.
+@end defopt
+
+@defopt emacs-devtools-mcp-spawn-idle-timeout
+Idle timeout, in seconds, for subordinate Emacs handles.  Default
+@code{1800} (30 minutes).  The reaper runs on a timer and on
+@code{kill-emacs-hook}.
+@end defopt
+
+@defopt emacs-devtools-mcp-spawn-max-handles
+Cap on the number of concurrently held subordinate handles.  Default
+@code{4}.
+@end defopt
+
+@defopt emacs-devtools-mcp-slow-tool-timeout
+@code{with-timeout} ceiling for @code{:slow} tools, in seconds.  Default
+@code{25}.
+@end defopt
+
+@defopt emacs-devtools-mcp-bisect-max-probes
+Hard cap on @code{bisect_init} iterations.  Default @code{12} --- enough
+for an init.el of @math{2^@{12@}} = 4096 forms.
+@end defopt
+
+@defopt emacs-devtools-mcp-init-batch-timeout
+Per-probe timeout, in seconds, for @code{emacs -Q --batch} subprocesses
+under @code{init_lint} / @code{startup_profile} / @code{bisect_init}.
+Default @code{30}.
+@end defopt
+
+@defopt emacs-devtools-mcp-redact-extra-regexps
+Additional regular expressions to scrub from @samp{*Messages*} /
+backtrace / profiler-frame output before it leaves the host.  Default
+@code{nil}.  The base set --- @code{auth-source-}, @code{epg-},
+@code{tramp-} --- is always applied.
+@end defopt
+
+@noindent
+Less-commonly-tuned knobs live alongside the relevant tool category and
+are documented via @code{customize-group}: the @code{*-page-size}
+variables for cursor pagination, @code{cursor-ttl-seconds},
+@code{backtrace-max-bytes}, @code{trace-log-line-max-bytes},
+@code{keys-simulate-text-cap}, @code{auth-log-failures},
+@code{spawn-ready-timeout}, @code{spawn-emacs-program},
+@code{spawn-emacsclient-program}.
+
+@node Security
+@chapter Security
+
+This is a developer tool for the user's own Emacs session.  @code{eval_elisp}
+is intentionally @strong{not sandboxed}, and @code{bisect_init} /
+@code{startup_profile} execute arbitrary code from the user's real
+@file{init.el} in subordinate @code{emacs -Q --batch} subprocesses.
+
+@section What is defended
+
+@itemize @bullet
+@item
+@strong{Transport}.  Unix-domain socket at @file{$XDG_RUNTIME_DIR/edmcp/},
+mode @code{0600}.  Hard fails if @env{XDG_RUNTIME_DIR} is unset; never
+falls back to @file{/tmp}.  Stale socket files are verified
+@code{S_ISSOCK} + same-uid + non-symlink before re-bind.
+@item
+@strong{Peer auth}.  @code{SO_PEERCRED} uid check on every accept, plus a
+per-launch random token in the first MCP frame.  The token lives in a
+sibling @code{0600} file at @file{$XDG_RUNTIME_DIR/edmcp/$NAME.token};
+the relay reads it and injects it into the @code{initialize} request's
+@code{params._meta.token}.
+@item
+@strong{Subprocess hygiene}.  @code{make-process} with explicit argv
+lists everywhere --- no @code{start-process-shell-command}.
+@code{server_name} validated against @code{[A-Za-z0-9_-]+}.
+@item
+@strong{Reader-macro injection}.  Subordinate output is parsed under
+@code{(let ((read-eval nil)) (read @dots{}))}.  Predicate strings and init
+files are additionally rejected up-front if they contain @code{#.} or
+@code{#@@} sequences.
+@item
+@strong{Init paths}.  Allowlist-checked via @code{expand-file-name} +
+@code{file-truename} + prefix match against
+@code{emacs-devtools-mcp-init-allowlist}.
+@item
+@strong{Output redaction}.  A regex layer scrubs lines mentioning
+@code{auth-source-}, @code{epg-}, and @code{tramp-} (plus
+@code{redact-extra-regexps}) from any @samp{*Messages*} / backtrace /
+profiler-frame surface before it leaves the host.
+@item
+@strong{Resource caps}.  @code{with-timeout} on every @code{:slow}
+handler; @code{max-response-bytes}; @code{screenshot-max-pixels};
+@code{unwind-protect} around @code{profiler-start}.
+@end itemize
+
+@section What is not defended
+
+@itemize @bullet
+@item @code{eval_elisp} / @code{simulate_keys} / @code{capture_backtrace}
+itself.  General-purpose execution by design.
+@item Multi-tenant access.  Single-user only.
+@item Networked transport.  Local stdio + Unix socket only.
+@item Side effects from subordinate batch processes.  They run with the
+user's @env{HOME}; an init file that writes files or contacts the network
+will do so during a probe.
+@end itemize
 
 @node Index
 @unnumbered Index

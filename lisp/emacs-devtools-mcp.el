@@ -48,5 +48,17 @@
   :group 'emacs-devtools-mcp
   :prefix "emacs-devtools-mcp-")
 
+;; Auto-load the tool subsystems whose code is unconditional (no
+;; external runtime deps).  Tool subsystems that hit X11 / spawn
+;; gates load lazily as their stories land.
+(eval-after-load 'emacs-devtools-mcp-server
+  '(progn
+     (require 'emacs-devtools-mcp-tools-eval)
+     (require 'emacs-devtools-mcp-tools-buffer)
+     (require 'emacs-devtools-mcp-tools-keys)
+     (require 'emacs-devtools-mcp-tools-gui)
+     (require 'emacs-devtools-mcp-tools-spawn)
+     (require 'emacs-devtools-mcp-tools-init)))
+
 (provide 'emacs-devtools-mcp)
 ;;; emacs-devtools-mcp.el ends here

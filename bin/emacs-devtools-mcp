@@ -1,0 +1,74 @@
+#!/bin/sh
+# emacs-devtools-mcp -- stdio <-> Unix-socket relay for the MCP host.
+#
+# Usage: invoked by an MCP client (e.g. Claude Code) via the `command'
+# field of an `.mcp.json' entry.  Reads MCP frames on stdin, relays
+# them to the host Emacs's Unix-domain socket at
+# `${XDG_RUNTIME_DIR}/edmcp/${EDMCP_NAME:-default}.sock', and writes
+# replies to stdout.  Injects the per-launch authentication token into
+# the first MCP frame's `params._meta.token' when that frame is an
+# `initialize' request.
+#
+# Hard-fails (no /tmp fallback) if `XDG_RUNTIME_DIR' is unset, the
+# socket is missing, or the token file is unreadable.
+
+set -eu
+
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+  printf 'emacs-devtools-mcp: XDG_RUNTIME_DIR is unset\n' >&2
+  exit 1
+fi
+
+NAME="${EDMCP_NAME:-default}"
+
+# Reject any NAME outside [A-Za-z0-9_-]+ so a hostile env var can't
+# escape the per-user $XDG_RUNTIME_DIR/edmcp/ directory via "../" or
+# slip in shell metacharacters that would later trip socat / jq.
+case "$NAME" in
+  '' | *[!A-Za-z0-9_-]*)
+    printf 'emacs-devtools-mcp: invalid EDMCP_NAME %s (allowed: [A-Za-z0-9_-]+)\n' \
+      "$NAME" >&2
+    exit 1
+    ;;
+esac
+
+SOCK="${XDG_RUNTIME_DIR}/edmcp/${NAME}.sock"
+TOKEN_FILE="${XDG_RUNTIME_DIR}/edmcp/${NAME}.token"
+
+if [ ! -S "$SOCK" ]; then
+  printf 'emacs-devtools-mcp: no socket at %s -- is the host server running?\n' \
+    "$SOCK" >&2
+  exit 1
+fi
+
+if [ ! -r "$TOKEN_FILE" ]; then
+  printf 'emacs-devtools-mcp: no readable token file at %s\n' "$TOKEN_FILE" >&2
+  exit 1
+fi
+
+TOKEN="$(cat -- "$TOKEN_FILE")"
+if [ -z "$TOKEN" ]; then
+  printf 'emacs-devtools-mcp: token file %s is empty\n' "$TOKEN_FILE" >&2
+  exit 1
+fi
+
+for cmd in jq socat; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    printf 'emacs-devtools-mcp: required command "%s" not on PATH\n' "$cmd" >&2
+    exit 1
+  fi
+done
+
+# Read the first MCP frame from stdin, inject `_meta.token' if it is
+# an `initialize' request, forward the (possibly-modified) line, then
+# stream the rest of stdin through unchanged.
+{
+  if IFS= read -r first_line; then
+    printf '%s' "$first_line" \
+      | jq -c --arg tok "$TOKEN" \
+          'if type == "object" and (.method // "") == "initialize"
+           then .params = ((.params // {}) | ._meta = ((._meta // {}) | .token = $tok))
+           else . end'
+    cat
+  fi
+} | exec socat - UNIX-CONNECT:"$SOCK"
