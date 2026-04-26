@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        emacs_version: ['29.1', '29.4', '30.1']
+        emacs_version: ['30.1']
 
     steps:
       - name: Check out
@@ -45,7 +45,7 @@ jobs:
                                    '(\"nongnu\" . \"https://elpa.nongnu.org/nongnu/\")) \
                       (package-initialize) \
                       (package-refresh-contents) \
-                      (dolist (p '(compat transient)) \
+                      (dolist (p '(transient)) \
                         (unless (package-installed-p p) \
                           (package-install p))))"
 
@@ -67,7 +67,7 @@ jobs:
           make EXTRA_LOAD="$ELPA_LOAD" test-mcp
 
       - name: Upload manual artifact
-        if: success() && matrix.emacs_version == '30.1'
+        if: success()
         # actions/upload-artifact v4
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

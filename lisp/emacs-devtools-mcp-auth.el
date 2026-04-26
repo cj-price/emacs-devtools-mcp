@@ -6,7 +6,7 @@
 ;; Homepage: https://github.com/cjprice/emacs-devtools-mcp
 ;; Keywords: tools, convenience
 ;; Package-Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:

@@ -6,7 +6,7 @@
 ;; Homepage: https://github.com/cjprice/emacs-devtools-mcp
 ;; Keywords: tools, convenience
 ;; Package-Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
@@ -194,10 +194,6 @@ Cancels outstanding continuations and runs the connection's
   (when (and (not (process-live-p proc))
              (process-get proc 'jsonrpc-connection))
     (let ((conn (process-get proc 'jsonrpc-connection)))
-      ;; `jsonrpc-connection' exposes the continuations alist via the
-      ;; private `:accessor jsonrpc--continuations'.  On Emacs 29.x the
-      ;; byte compiler doesn't see eieio accessor methods as fbound, so
-      ;; reach into the slot via `eieio-oref' (a public, fbound API).
       (mapc (lambda (cont)
               (pcase-let ((`(,_id ,_method ,_succ ,error-fn ,timer) cont))
                 (when timer (cancel-timer timer))
@@ -206,8 +202,8 @@ Cancels outstanding continuations and runs the connection's
                     (funcall error-fn
                              (list :code -1
                                    :message "Connection died"))))))
-            (eieio-oref conn '-continuations))
-      (jsonrpc-forget-pending-continuations conn)
+            (jsonrpc--continuations conn))
+      (setf (jsonrpc--continuations conn) nil)
       (ignore-errors
         (funcall (edmcp--rpc-on-shutdown conn) conn)))))
 

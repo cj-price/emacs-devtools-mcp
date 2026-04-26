@@ -84,7 +84,7 @@ the quickstart and a usage transcript.
 @section Requirements
 
 @itemize @bullet
-@item GNU Emacs 29.1 or newer.
+@item GNU Emacs 30.1 or newer.
 @item @command{socat} and @command{jq} on @env{PATH}.
 @item For headless / GUI tests: @command{xvfb-run} and @command{grim}.
 @end itemize

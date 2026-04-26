@@ -41,4 +41,4 @@ Initial release.  v1 tool surface complete: 36 tools across 8 categories.
 
 * `make all | lisp | test | test-fast | test-daemon | test-gui |
   test-mcp | lint | manual | clean`.
-* CI matrix: Emacs 29.1, 29.4, 30.1.
+* CI: Emacs 30.1.

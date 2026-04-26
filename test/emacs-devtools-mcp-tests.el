@@ -1059,6 +1059,20 @@ collect the relay's stderr.  Returns the live process."
      :filter (lambda (_p s) (funcall stdout-fn s))
      :stderr stderr-buf)))
 
+(defun emacs-devtools-mcp-tests--relay-drain-stderr (stderr-buf)
+  "Wait for the relay's stderr pipe sub-process attached to STDERR-BUF.
+With `:stderr BUFFER', `make-process' creates a hidden pipe process
+that asynchronously pumps the child's stderr into STDERR-BUF; the
+main process can exit before that pipe drains.  Block until the
+pipe sub-process is gone (or a 1 s budget runs out)."
+  (let ((deadline (+ (float-time) 1.0)))
+    (while (and (< (float-time) deadline)
+                (cl-some (lambda (p)
+                           (and (eq (process-buffer p) stderr-buf)
+                                (process-live-p p)))
+                         (process-list)))
+      (accept-process-output nil 0.05))))
+
 (ert-deftest emacs-devtools-mcp-tests/relay-hard-fails-without-xdg ()
   "Relay exits non-zero with a message when XDG_RUNTIME_DIR is unset."
   :tags '(:fast)
@@ -1071,6 +1085,7 @@ collect the relay's stderr.  Returns the live process."
           (with-timeout (3 (error "relay did not exit"))
             (while (process-live-p proc)
               (accept-process-output proc 0.05)))
+          (emacs-devtools-mcp-tests--relay-drain-stderr stderr)
           (should (not (zerop (process-exit-status proc))))
           (with-current-buffer stderr
             (should (string-match-p "XDG_RUNTIME_DIR is unset"
@@ -1092,6 +1107,7 @@ collect the relay's stderr.  Returns the live process."
           (with-timeout (3 (error "relay did not exit"))
             (while (process-live-p proc)
               (accept-process-output proc 0.05)))
+          (emacs-devtools-mcp-tests--relay-drain-stderr stderr)
           (should (not (zerop (process-exit-status proc))))
           (with-current-buffer stderr
             (should (string-match-p "no socket at" (buffer-string)))))
@@ -1126,6 +1142,7 @@ socket-existence check passes and the token check is exercised."
           (with-timeout (3 (error "relay did not exit"))
             (while (process-live-p proc)
               (accept-process-output proc 0.05)))
+          (emacs-devtools-mcp-tests--relay-drain-stderr stderr)
           (should (not (zerop (process-exit-status proc))))
           (with-current-buffer stderr
             (should (string-match-p "no readable token file"

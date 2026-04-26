@@ -45,7 +45,7 @@ test/
   emacs-devtools-mcp-xvfb-tests.el   :gui
 shell.nix                            emacs 30, xvfb-run, socat, gnumake, texinfo, grim, jq, rg, fd
 Makefile                             all | lisp | test | test-fast | test-daemon | test-gui | test-mcp | lint | manual | clean | install
-.github/workflows/ci.yml             matrix: emacs 29.1 / 29.4 / 30.1
+.github/workflows/ci.yml             emacs 30.1
 CHANGELOG  CONTRIBUTING.md  LICENSE  README.md
 ```
 
@@ -72,7 +72,7 @@ JSON wire keys: **`snake_case`** (`server_name`, `with_properties`, `print_level
 ;; Homepage: https://github.com/cjprice/emacs-devtools-mcp
 ;; Keywords: tools, convenience
 ;; Package-Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (compat "30.1") (transient "0.6.0"))
+;; Package-Requires: ((emacs "30.1") (transient "0.6.0"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
@@ -99,7 +99,7 @@ Key defcustoms: `emacs-devtools-mcp-max-response-bytes` (256 KiB), `screenshot-m
 
 ## Keymaps & menus
 
-`defvar-keymap` (Emacs 29+). User entry point is `M-x emacs-devtools-mcp` — a `transient-define-prefix` with start/stop, list/kill handles, run tests, customize. Autoload cookies on the dispatcher and `emacs-devtools-mcp-{start,stop}` only; **not** every tool. Magit doesn't autoload its entire surface either.
+`defvar-keymap`. User entry point is `M-x emacs-devtools-mcp` — a `transient-define-prefix` with start/stop, list/kill handles, run tests, customize. Autoload cookies on the dispatcher and `emacs-devtools-mcp-{start,stop}` only; **not** every tool. Magit doesn't autoload its entire surface either.
 
 ## Tool registration
 
@@ -185,7 +185,7 @@ make lint           checkdoc-file every lisp/*.el; zero warnings
 make manual         makeinfo manual/emacs-devtools-mcp.texi
 ```
 
-CI matrix: Emacs 29.1, 29.4, 30.1. `make all` + `make test-mcp` on every push. Build fails on any byte-compile or checkdoc warning.
+CI: Emacs 30.1. `make all` + `make test-mcp` on every push. Build fails on any byte-compile or checkdoc warning.
 
 ## Tests
 
@@ -215,7 +215,6 @@ CI matrix: Emacs 29.1, 29.4, 30.1. `make all` + `make test-mcp` on every push. B
 - `where-is-internal`, `lookup-key`, `key-binding`, `execute-kbd-macro` — keybinding tools.
 - `profiler-start` / `profiler-report-cpu` — startup profile (always under `unwind-protect`).
 - `transient` — menus.
-- `compat 30.1` — cross-version shims; floor Emacs 29.1.
 - `propcheck` — test-only property generation.
 - `xvfb-run`, `socat`, `grim` — nixpkgs.
 

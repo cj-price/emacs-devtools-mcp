@@ -12,7 +12,7 @@ nix-shell --run 'make test-fast'   # sub-second pure tests
 nix-shell --run 'make lint'        # checkdoc, zero warnings
 ```
 
-CI runs `make all` against Emacs 29.1, 29.4, 30.1.
+CI runs `make all` against Emacs 30.1.
 
 ## Code style
 

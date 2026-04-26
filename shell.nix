@@ -2,9 +2,8 @@
 
 let
   # Emacs 30.x with the package's runtime deps pre-installed, so `make lisp`
-  # and `make test` find `compat` and `transient` without M-x package-install.
+  # and `make test` find `transient` without M-x package-install.
   emacsWithDeps = pkgs.emacs30.pkgs.withPackages (epkgs: with epkgs; [
-    compat
     transient
   ]);
 in

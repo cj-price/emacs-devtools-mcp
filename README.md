@@ -9,7 +9,7 @@ gives an agent for the browser, but for Emacs.
 
 **Status**: 0.1.0 — feature-complete for the v1 tool surface (36 tools across
 8 categories). Pre-release; no public API stability guarantees yet. Tested on
-Emacs 29.1, 29.4, and 30.1.
+Emacs 30.1.
 
 ## What you can ask an agent to do
 
@@ -46,7 +46,7 @@ agent ──stdio──▶ bin/emacs-devtools-mcp ──unix socket──▶ Hos
 
 ## Installing
 
-You need: Emacs ≥29.1, `socat`, `jq`, and (for headless / GUI tests) `xvfb-run`
+You need: Emacs ≥30.1, `socat`, `jq`, and (for headless / GUI tests) `xvfb-run`
 and `grim`. The repo ships a `shell.nix` that pins all of those.
 
 ```sh
@@ -223,7 +223,7 @@ make lint         checkdoc-file every lisp/*.el; zero warnings
 make manual       makeinfo manual/emacs-devtools-mcp.texi
 ```
 
-CI: GitHub Actions matrix on Emacs 29.1, 29.4, 30.1. `make all` and
+CI: GitHub Actions on Emacs 30.1. `make all` and
 `make test-mcp` on every push. Build fails on any byte-compile or checkdoc
 warning.
 
