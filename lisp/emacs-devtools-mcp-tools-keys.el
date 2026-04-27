@@ -352,7 +352,17 @@ no re-walk between pages."
   :handler #'edmcp--tools-where-is)
 
 (emacs-devtools-mcp-deftool lookup-key
-    "Return the command bound to KEYS in KEYMAP (default global)."
+    "Return the command bound to KEYS in KEYMAP (default global).
+Result shape:
+  `{\"binding\": \"command-name\"}' -- a regular binding,
+  `{\"binding\": \"undefined\"}'    -- KEYS is unbound,
+  `{\"keymap\": true}'              -- KEYS terminates inside a prefix
+                                    map (e.g. `\"C-x\"' alone),
+  `{\"prefix\": N}'                 -- KEYS is a partial sequence that
+                                    consumed N events before falling
+                                    off the keymap (e.g. `\"C-x z\"'
+                                    when `C-x' is a prefix but `z'
+                                    isn't bound under it)."
   :cost :fast
   :read-only t
   :idempotent t
@@ -378,7 +388,12 @@ no re-walk between pages."
   :handler #'edmcp--tools-describe-keymap)
 
 (emacs-devtools-mcp-deftool simulate-keys
-    "Run KEYS as a `kbd' macro in BUFFER and return the state delta."
+    "Run KEYS as a `kbd' macro in BUFFER and return the state delta.
+KEYS is parsed by `kbd', which silently treats unrecognized
+events as `self-insert-command' -- e.g. `(kbd \"!#$invalid\")'
+mutates the buffer rather than raising.  Pass real key sequences
+(e.g. `\"C-n\"', `\"M-x foo RET\"') and verify the returned state
+delta to confirm the intended commands ran."
   :cost :slow
   :read-only nil
   :destructive t

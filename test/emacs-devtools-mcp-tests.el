@@ -1032,6 +1032,51 @@ return its slow value."
     (should (emacs-devtools-mcp--tool-record "helper_test"))
     (should-not (emacs-devtools-mcp--tool-record "no_such_tool"))))
 
+(ert-deftest emacs-devtools-mcp-tests/array-fields-encode-as-json-arrays ()
+  "Every documented array field round-trips as a JSON array, not an object.
+`json-serialize' encodes vectors as JSON arrays and Elisp lists as
+JSON objects -- so a list-of-strings handler return would give the
+client `\\='alist-shaped\\=' garbage instead of the expected `\\=[\"a\"]\\='.
+The describe-hooks shape regression (commit `d08804d') hit exactly
+this trap.  This test calls every easy-to-call array-returning
+handler and asserts the documented array slot is a vector both
+in-memory and after a `json-serialize'/`json-parse-string'
+round-trip with `:array-type \\='array'."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-fresh-cursors
+    (with-temp-buffer
+      (rename-buffer "edmcp-shape-fixture" t)
+      (dolist (case `((,#'edmcp--tools-list-buffers () :buffers)
+                      (,#'edmcp--tools-list-faces () :faces)
+                      (,#'edmcp--tools-list-warnings () :warnings)
+                      (,#'edmcp--tools-list-messages () :messages)
+                      (,#'edmcp--tools-describe-keymap
+                       (:keymap "global-map") :bindings)
+                      (,#'edmcp--tools-describe-hooks () :hooks)
+                      (,#'edmcp--tools-describe-hooks
+                       (:hook "kill-emacs-hook") :functions)
+                      (,#'edmcp--tools-spawn-list () :handles)
+                      (,#'edmcp--tools-where-is
+                       (:command "self-insert-command") :bindings)))
+        (let* ((handler (nth 0 case))
+               (params  (nth 1 case))
+               (field   (nth 2 case))
+               (res     (funcall handler params))
+               (val     (plist-get res field)))
+          (should (vectorp val))
+          ;; Wire-shape sanity: an empty vector encodes as JSON `[]'
+          ;; (a list of zero strings would encode as `{}').  Pin the
+          ;; contract on a payload-free copy of the same shape so the
+          ;; test does not depend on the buffer/face contents being
+          ;; valid UTF-8 (some bindings carry raw bytes that
+          ;; `json-serialize' rejects, which is a separate concern).
+          (let* ((json (json-serialize (list field (vector))))
+                 (parsed (json-parse-string
+                          json :object-type 'plist
+                          :array-type 'array)))
+            (should (vectorp (plist-get parsed field)))
+            (should (= 0 (length (plist-get parsed field))))))))))
+
 ;;;; ___Relay___
 ;;
 ;; `bin/emacs-devtools-mcp' POSIX-sh stdio<->socket relay.  Tests
@@ -1186,6 +1231,45 @@ socket-existence check passes and the token check is exercised."
         (should-not (plist-get alpha-annot :readOnlyHint))
         (should (eq t (plist-get zulu-annot :readOnlyHint)))
         (should (eq t (plist-get zulu-annot :idempotentHint)))))))
+
+(defconst emacs-devtools-mcp-tests--golden-dir
+  (expand-file-name
+   "golden/"
+   (file-name-directory (or load-file-name buffer-file-name)))
+  "Directory holding checked-in wire-format snapshots.")
+
+(ert-deftest emacs-devtools-mcp-tests/tools-list-matches-golden-hash ()
+  "The canonical `tools/list' JSON hashes to the checked-in golden value.
+A drift here means one of two things: a tool's schema changed
+without bumping `test/golden/tools-list.sha256' (so reviewers can
+see the wire-shape change in the diff), or stale state from a
+previous load is bleeding into the current registry (the
+`with_properties' artifact discovered during planning).  Either is
+worth catching loudly.
+
+Updating the golden: re-compute with
+  (secure-hash \\='sha256
+   (json-serialize (edmcp--server-tools-list nil)
+                   :false-object :json-false :null-object nil))
+and write the new value into `test/golden/tools-list.sha256'.
+
+Note: this test reads the *live, currently-loaded* registry rather
+than allocating a fresh one -- the global registry is exactly what
+the wire serves, and that is what a stale-host bug would
+contaminate."
+  :tags '(:fast)
+  (let* ((golden-path
+          (expand-file-name "tools-list.sha256"
+                            emacs-devtools-mcp-tests--golden-dir))
+         (golden (string-trim
+                  (with-temp-buffer
+                    (insert-file-contents golden-path)
+                    (buffer-string))))
+         (json (json-serialize (edmcp--server-tools-list nil)
+                               :false-object :json-false
+                               :null-object nil))
+         (actual (secure-hash 'sha256 json)))
+    (should (equal golden actual))))
 
 (ert-deftest emacs-devtools-mcp-tests/dispatch-tools-list-includes-input-schema ()
   "Every entry carries `:inputSchema'; default is `{type:object}'."
@@ -1533,6 +1617,41 @@ paren run -- this test pins the boundary."
   (let ((input "  (my-pkg-call-auth-source-foo arg)"))
     (should (equal input (emacs-devtools-mcp-redact input)))))
 
+(ert-deftest emacs-devtools-mcp-tests/redact-rejects-invalid-extra-regexp ()
+  "Bad user regex in `redact-extra-regexps' fails with a clear `user-error'.
+Pre-fix, `string-match-p' would signal `invalid-regexp' deep
+inside the redaction loop on the first tool that produced output;
+the agent saw a stack frame from the helper, not the offending
+config line.  Validation now happens up-front and names the bad
+pattern."
+  :tags '(:fast)
+  (let* ((emacs-devtools-mcp-redact-extra-regexps '("["))
+         (err (should-error
+               (emacs-devtools-mcp-redact "auth-source-foo\nkept")
+               :type 'user-error)))
+    (should (string-match-p "Invalid redaction regexp"
+                            (error-message-string err)))
+    (should (string-match-p "\\[" (error-message-string err)))))
+
+(ert-deftest emacs-devtools-mcp-tests/redact-rejects-non-string-pattern ()
+  "Non-string entries in `redact-extra-regexps' are rejected loudly."
+  :tags '(:fast)
+  (let* ((emacs-devtools-mcp-redact-extra-regexps '(42))
+         (err (should-error
+               (emacs-devtools-mcp-redact "auth-source-foo")
+               :type 'user-error)))
+    (should (string-match-p "not a string"
+                            (error-message-string err)))))
+
+(ert-deftest emacs-devtools-mcp-tests/redact-handles-empty-extra-regexps ()
+  "An empty extra-regexps list leaves the default behavior intact.
+Validation must not introduce a regression for the common case of
+`emacs-devtools-mcp-redact-extra-regexps' set to its default `nil'."
+  :tags '(:fast)
+  (let ((emacs-devtools-mcp-redact-extra-regexps nil))
+    (should (equal "kept"
+                   (emacs-devtools-mcp-redact "auth-source-foo\nkept")))))
+
 ;;;; ___Random hex___
 
 ;; Regression: an earlier implementation read `/dev/urandom' via
@@ -1667,6 +1786,83 @@ warning is gone."
       (should (stringp c2))
       (let ((tail (emacs-devtools-mcp--cursor-fetch c2)))
         (should (equal '(5) tail))))))
+
+(ert-deftest emacs-devtools-mcp-tests/paginate-bogus-cursor-signals-32602 ()
+  "An unknown cursor token raises a JSON-RPC `-32602' rather than `()'.
+A silent empty page would be indistinguishable from end-of-iteration
+and would cause the agent to terminate its scan early -- losing the
+remainder of the data without any indication that the cursor was
+junk.  Pinning the loud failure here means the contract holds for
+every paginating tool that flows through `emacs-devtools-mcp--paginate'."
+  :tags '(:fast)
+  (let ((emacs-devtools-mcp--cursors (make-hash-table :test 'equal)))
+    (let ((err (should-error
+                (emacs-devtools-mcp--paginate '(a b c) 2 "deadbeef")
+                :type 'jsonrpc-error)))
+      (should (= -32602 (alist-get 'jsonrpc-error-code (cdr err)))))))
+
+(ert-deftest emacs-devtools-mcp-tests/paginate-consumed-cursor-rejected-on-reuse ()
+  "Cursors are single-use: the second fetch of the same token errors.
+Without this contract a buggy client could double-page over the
+same window and never advance, or worse, silently re-emit a page
+the user already saw.  We pop the entry on first fetch (see
+`emacs-devtools-mcp--cursor-fetch') so the second call must hit
+the bogus-cursor branch and raise `-32602'."
+  :tags '(:fast)
+  (let ((emacs-devtools-mcp--cursors (make-hash-table :test 'equal)))
+    (pcase-let* ((`(,_ ,c1)
+                  (emacs-devtools-mcp--paginate '(1 2 3 4 5) 2 nil)))
+      (should (stringp c1))
+      ;; First reuse: legitimate continuation, succeeds.
+      (pcase-let ((`(,page ,_) (emacs-devtools-mcp--paginate nil 2 c1)))
+        (should (equal '(3 4) page)))
+      ;; Second reuse: cursor was consumed by the previous call.
+      (let ((err (should-error
+                  (emacs-devtools-mcp--paginate nil 2 c1)
+                  :type 'jsonrpc-error)))
+        (should (= -32602 (alist-get 'jsonrpc-error-code (cdr err))))))))
+
+(ert-deftest emacs-devtools-mcp-tests/paginating-handlers-reject-bogus-cursor ()
+  "Every paginating handler propagates the cursor-store failure as `-32602'.
+A regression here would mean the handler called `cursor-fetch'
+directly (which returns nil for unknown tokens) instead of routing
+through `--paginate' (which signals).  Either path returns an
+empty page on bogus input -- which is indistinguishable from
+end-of-iteration to the agent.  Loud failure is the contract; we
+pin every paginating tool to it."
+  :tags '(:fast)
+  (dolist (case `((edmcp--tools-list-buffers (:cursor "deadbeef"))
+                  (edmcp--tools-list-messages (:cursor "deadbeef"))
+                  (edmcp--tools-list-warnings (:cursor "deadbeef"))
+                  (edmcp--tools-list-faces (:cursor "deadbeef"))
+                  (edmcp--tools-describe-keymap
+                   (:keymap "global-map" :cursor "deadbeef"))
+                  (edmcp--tools-spawn-list (:cursor "deadbeef"))))
+    (let ((emacs-devtools-mcp--cursors (make-hash-table :test 'equal)))
+      (let ((err (should-error
+                  (funcall (car case) (cadr case))
+                  :type 'jsonrpc-error)))
+        (should (= -32602
+                   (alist-get 'jsonrpc-error-code (cdr err))))))))
+
+(ert-deftest emacs-devtools-mcp-tests/paginate-cross-tool-cursor-fungible ()
+  "Cursors are tool-agnostic by design: a token from tool A resumes in B.
+This pins the existing contract.  The cursor store keys by token
+only, not by issuing tool, and the `paginate' helper has no way to
+know which tool produced the saved tail.  If we ever decide to
+scope cursors to a tool name, this test should flip from a positive
+assertion to `should-error', and the change to the contract will
+be visible in the diff."
+  :tags '(:fast)
+  (let ((emacs-devtools-mcp--cursors (make-hash-table :test 'equal)))
+    ;; Tool A allocates a cursor.
+    (pcase-let* ((`(,_ ,tok)
+                  (emacs-devtools-mcp--paginate '(x y z) 1 nil)))
+      (should (stringp tok))
+      ;; Tool B fetches that cursor with a different page size.
+      (pcase-let ((`(,page ,_) (emacs-devtools-mcp--paginate nil 5 tok)))
+        ;; Whatever tool A had stashed comes back, page size honored.
+        (should (equal '(y z) page))))))
 
 ;;;; ___Spawn dispatch (host)___
 
@@ -3079,6 +3275,37 @@ prefixes are absent from `:backtrace'."
   (should-error
    (edmcp--tools-buffer-state '(:buffer "edmcp-no-such-buffer-here"))))
 
+(ert-deftest emacs-devtools-mcp-tests/buffer-state-killed-mid-call-envelopes ()
+  "A buffer killed between schema-validate and handler emits a tool envelope.
+Goes through the full dispatcher so we exercise the
+`condition-case' wrapper -- the bare `error' that the handler
+signals when `get-buffer' returns nil must reach the wire as
+`isError: true' with a content block, not bubble out as a
+JSON-RPC -32603."
+  :tags '(:fast)
+  (let* ((name (format "edmcp-killed-%d" (random 100000)))
+         (_ (with-current-buffer (get-buffer-create name)
+              (insert "alive")))
+         (orig-fn (symbol-function 'get-buffer))
+         (env nil))
+    ;; Stub `get-buffer' so it pretends the buffer was killed between
+    ;; the schema validator and the handler body.
+    (cl-letf (((symbol-function 'get-buffer)
+               (lambda (n &rest args)
+                 (if (and (stringp n) (equal n name))
+                     nil
+                   (apply orig-fn n args)))))
+      (setq env (edmcp--server-tools-call
+                 nil
+                 (list :name "buffer_state"
+                       :arguments (list :buffer name)))))
+    (when (get-buffer name) (kill-buffer name))
+    (should (eq t (plist-get env :isError)))
+    (let* ((blocks (plist-get env :content))
+           (text (and blocks (plist-get (aref blocks 0) :text))))
+      (should (stringp text))
+      (should (string-match-p "Buffer not found" text)))))
+
 (ert-deftest emacs-devtools-mcp-tests/buffer-substring-returns-text ()
   "Plain `buffer-substring' returns the requested slice without truncation."
   :tags '(:fast)
@@ -3154,6 +3381,57 @@ preserve them would be a lie; we drop them server-side."
       (should (equal "hi" text))
       (should-not (get-text-property 0 'face text)))))
 
+(ert-deftest emacs-devtools-mcp-tests/buffer-substring-zero-width-slice ()
+  "An equal start/end pair returns empty text without erroring.
+The bounds-check fires only on `start > end'; an empty range is a
+valid request (e.g.\\ probing for a buffer's existence at a known
+location) and must succeed with `text=\"\"' and no truncation."
+  :tags '(:fast)
+  (with-temp-buffer
+    (rename-buffer "edmcp-substring-zero" t)
+    (insert "abcdef")
+    (let ((res (edmcp--tools-buffer-substring
+                '(:buffer "edmcp-substring-zero"
+                  :start 3 :end 3))))
+      (should (equal "" (plist-get res :text)))
+      (should (eq :json-false (plist-get res :truncated))))))
+
+(ert-deftest emacs-devtools-mcp-tests/buffer-substring-respects-multibyte-boundary ()
+  "`max_bytes' never mid-cuts a multibyte UTF-8 codepoint.
+A 4-byte emoji with `max_bytes=2' yields empty text and
+`truncated:t', not half a codepoint -- otherwise the returned
+string would fail to decode and any client that doesn't
+defensively re-validate could corrupt downstream rendering.
+
+Pins the contract on a `max_bytes' that is *too small for any
+character*: the call returns successfully with no progress, and
+the client's `next_offset' equals its `start'.  That stable
+sentinel is what callers detect to bump the cap rather than
+spinning."
+  :tags '(:fast)
+  (with-temp-buffer
+    (rename-buffer "edmcp-substring-mb" t)
+    (insert "👍AB")
+    (let ((res (edmcp--tools-buffer-substring
+                `(:buffer "edmcp-substring-mb"
+                  :start ,(point-min)
+                  :end ,(point-max)
+                  :max_bytes 2))))
+      (should (eq t (plist-get res :truncated)))
+      (should (equal "" (plist-get res :text)))
+      (should (= (point-min) (plist-get res :next_offset))))
+    ;; With max_bytes=4 the emoji fits exactly, but the trailing
+    ;; "AB" must not -- and the truncation marker advances to the
+    ;; character after the emoji.
+    (let ((res (edmcp--tools-buffer-substring
+                `(:buffer "edmcp-substring-mb"
+                  :start ,(point-min)
+                  :end ,(point-max)
+                  :max_bytes 4))))
+      (should (eq t (plist-get res :truncated)))
+      (should (equal "👍" (plist-get res :text)))
+      (should (= (1+ (point-min)) (plist-get res :next_offset))))))
+
 
 (ert-deftest emacs-devtools-mcp-tests/list-messages-returns-redacted-tail ()
   "Recent *Messages* entries surface, with redacted lines stripped."
@@ -3182,6 +3460,19 @@ had no signal that the call had been malformed."
     (should-error (edmcp--tools-list-messages '(:n -1)))
     ;; nil n is still accepted (defaults to page size).
     (should (edmcp--tools-list-messages '()))))
+
+(ert-deftest emacs-devtools-mcp-tests/list-messages-rejects-bad-n-with-cursor ()
+  "Non-positive `n' is rejected even when a `cursor' is also supplied.
+The cursor path skips the spawn-call (and thus the `messages-tail'
+n-validation), but a malformed `n' is a caller bug regardless --
+silently letting the cursor win would mask it.  Up-front
+validation in the handler catches the case."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-fresh-cursors
+    (should-error
+     (edmcp--tools-list-messages '(:n 0 :cursor "any-token")))
+    (should-error
+     (edmcp--tools-list-messages '(:n -5 :cursor "any-token")))))
 
 (ert-deftest emacs-devtools-mcp-tests/list-warnings-returns-empty-when-no-buffer ()
   "If *Warnings* doesn't exist, the result is an empty array."
@@ -3212,6 +3503,35 @@ had no signal that the call had been malformed."
               (should (stringp (plist-get second :next_cursor)))))
         (kill-buffer "*Warnings*")))))
 
+(ert-deftest emacs-devtools-mcp-tests/list-warnings-redacts-paragraphs ()
+  "*Warnings* paragraphs flow through `emacs-devtools-mcp-redact'.
+Pre-fix, `--warnings-list' returned the raw split paragraphs --
+which meant an `auth-source-' / `epg-' / `tramp-' line dropped
+into *Warnings* (e.g.\\ by a credential lookup probe) would
+escape the redaction layer that gates `list-messages',
+backtraces, and trace output.  Pinned alongside its sibling
+`list-messages-returns-redacted-tail'."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-fresh-cursors
+    (with-current-buffer (get-buffer-create "*Warnings*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "harmless first warning\n\n"
+                "auth-source-search failed: secret=SHHH\n\n"
+                "epg-decrypt-string panic: hunter2\n\n"
+                "another harmless paragraph\n")))
+    (unwind-protect
+        (let* ((res (edmcp--tools-list-warnings '()))
+               (paras (append (plist-get res :warnings) nil))
+               (joined (mapconcat #'identity paras "\n")))
+          (should-not (string-match-p "auth-source-search" joined))
+          (should-not (string-match-p "epg-decrypt-string" joined))
+          (should-not (string-match-p "SHHH" joined))
+          (should-not (string-match-p "hunter2" joined))
+          (should (string-match-p "harmless first warning" joined))
+          (should (string-match-p "another harmless paragraph" joined)))
+      (kill-buffer "*Warnings*"))))
+
 (ert-deftest emacs-devtools-mcp-tests/ert-run-summarizes ()
   "`ert-run' against a known passing selector returns a clean summary."
   :tags '(:fast)
@@ -3226,6 +3546,29 @@ had no signal that the call had been malformed."
           (should (= 1 (plist-get res :passed)))
           (should (= 0 (plist-get res :failed)))
           (should (eq t (plist-get res :ok))))
+      (unintern sym nil))))
+
+(ert-deftest emacs-devtools-mcp-tests/ert-run-emits-failures-vector-on-success ()
+  "On a clean pass the `:failures' field is `[]', not `nil' or `:null'.
+A nil here would serialize as JSON `null' and clients would have to
+guard `length' calls with a type check.  A list-of-zero would
+serialize as a JSON object.  Both are wire shapes the agent has
+already learned not to expect.  The contract is `[]' --
+empty JSON array -- and we pin it here."
+  :tags '(:fast)
+  (let* ((name (format "edmcp-ert-fixture-zero-fail-%d" (random 100000)))
+         (sym (intern name)))
+    (eval `(ert-deftest ,sym () (should t)) t)
+    (unwind-protect
+        (let* ((res (edmcp--tools-ert-run `(:selector ,name)))
+               (failures (plist-get res :failures)))
+          (should (vectorp failures))
+          (should (= 0 (length failures)))
+          ;; Wire round-trip: the field encodes as a JSON array `[]'.
+          (let* ((json (json-serialize (list :failures failures)))
+                 (parsed (json-parse-string json :object-type 'plist)))
+            (should (vectorp (plist-get parsed :failures)))
+            (should (= 0 (length (plist-get parsed :failures))))))
       (unintern sym nil))))
 
 (ert-deftest emacs-devtools-mcp-tests/ert-run-reports-failure ()
@@ -3689,6 +4032,48 @@ noise for agents trying to discover keystrokes."
         (makunbound sym)
         (unintern sym nil)))))
 
+(ert-deftest emacs-devtools-mcp-tests/describe-keymap-empty-map-returns-empty-array ()
+  "A bound but empty keymap returns `:bindings []' without erroring.
+Distinguishes \"valid keymap, no bindings\" from \"unknown keymap\"
+(which signals).  The wire shape is a JSON array, not nil; clients
+can `length' it without a type guard."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-fresh-cursors
+    (let* ((sym (intern (format "edmcp-empty-keymap-%d" (random 100000)))))
+      (set sym (make-sparse-keymap))
+      (unwind-protect
+          (let* ((res (edmcp--tools-describe-keymap
+                       `(:keymap ,(symbol-name sym))))
+                 (bindings (plist-get res :bindings)))
+            (should (vectorp bindings))
+            (should (= 0 (length bindings)))
+            (should-not (plist-get res :next_cursor)))
+        (makunbound sym)
+        (unintern sym nil)))))
+
+(ert-deftest emacs-devtools-mcp-tests/describe-keymap-unmatched-prefix-returns-empty ()
+  "A `prefix' that matches no binding returns an empty page, not an error.
+The prefix filter is a *narrower*, not a precondition: an empty
+result is the natural answer to \"what bindings start with X\" when
+X is not a prefix of any binding.  Pinning this contract guards
+against a future regression that would error on the empty-narrow
+case."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-fresh-cursors
+    (let* ((sym (intern (format "edmcp-prefix-miss-%d" (random 100000))))
+           (m (make-sparse-keymap)))
+      (define-key m (kbd "C-c a") 'forward-char)
+      (define-key m (kbd "C-c b") 'backward-char)
+      (set sym m)
+      (unwind-protect
+          (let* ((res (edmcp--tools-describe-keymap
+                       `(:keymap ,(symbol-name sym)
+                         :prefix "C-z"))))
+            (should (vectorp (plist-get res :bindings)))
+            (should (= 0 (length (plist-get res :bindings)))))
+        (makunbound sym)
+        (unintern sym nil)))))
+
 (ert-deftest emacs-devtools-mcp-tests/simulate-keys-moves-point ()
   "Cursor-motion commands run by `simulate-keys' update point."
   :tags '(:fast)
@@ -3926,6 +4311,44 @@ to tell the call had used an out-of-range coordinate."
     (should-error
      (edmcp--tools-face-at
       '(:buffer "edmcp-face-col-neg" :line 1 :column -1)))))
+
+(ert-deftest emacs-devtools-mcp-tests/face-at-honors-narrowing ()
+  "`face-at' counts lines through the *visible* region of a narrowed buffer.
+`forward-line' from `(point-min)' both respect narrowing, so a
+buffer with 10 underlying lines but narrowed to 3 visible lines
+treats line 4 as out-of-range -- that's the contract the agent
+needs (lines visible to the buffer is what they can address).
+Pre-fix or post-regression, a silent clamp here would resolve the
+agent's request to a face from the wrong line.
+
+Also pin the success path inside the narrowed region so a future
+change cannot \"fix\" the OOB error by accidentally widening."
+  :tags '(:fast)
+  (with-temp-buffer
+    (rename-buffer "edmcp-face-narrow" t)
+    (dotimes (i 10) (insert (format "line%d\n" i)))
+    ;; Narrow to the third line only (1-based: starts at char 13).
+    (let* ((bol3 (save-excursion
+                   (goto-char (point-min))
+                   (forward-line 2)
+                   (point)))
+           (eol3 (save-excursion (goto-char bol3) (line-end-position))))
+      (narrow-to-region bol3 eol3))
+    ;; Inside the narrowed region: line 1 resolves.
+    (let ((res (edmcp--tools-face-at
+                '(:buffer "edmcp-face-narrow"
+                  :line 1 :column 0))))
+      (should (stringp (plist-get res :face))))
+    ;; Beyond the narrowed region: error mentions the line count
+    ;; that is *visible*, not the underlying buffer's 10 lines.
+    (let* ((err (should-error
+                 (edmcp--tools-face-at
+                  '(:buffer "edmcp-face-narrow" :line 4 :column 0))))
+           (msg (error-message-string err)))
+      (should (string-match-p "past end of buffer" msg))
+      ;; The narrowed region has exactly 1 line; the error message
+      ;; carries that count, not "10".
+      (should-not (string-match-p "10 lines" msg)))))
 
 (ert-deftest emacs-devtools-mcp-tests/describe-face-default ()
   "`default' face has a name and an attribute alist."
@@ -4535,7 +4958,27 @@ it.  Caller is responsible for writing content to FILE."
       (should (or (vectorp (plist-get res :top))
                   (listp (plist-get res :top))))
       (should (stringp (plist-get res :raw)))
-      (should (eq :json-false (plist-get res :parse_error))))))
+      (should (eq :json-false (plist-get res :parse_error)))
+      (should (eq :json-false (plist-get res :load_error))))))
+
+(ert-deftest emacs-devtools-mcp-tests/init-startup-profile-surfaces-load-error ()
+  "An init that fails to `require' a missing package surfaces `:load_error'.
+This is the agent's escape hatch for the `-Q --batch' load-path
+gotcha: the runner can't see ELPA, so any `(require \\='foo)' that
+the user's normal startup would resolve via package autoloads
+fails inside the probe.  Without `:load_error', the result looks
+like a fast clean run (`exit_code 0', `samples 0', empty `:top'),
+which hides the problem."
+  :tags '(:daemon)
+  (emacs-devtools-mcp-tests--with-init-fixture (dir file)
+    (with-temp-file file
+      (insert ";;; -*- lexical-binding:t -*-\n"
+              "(require 'edmcp-no-such-package-anywhere-12345)\n"))
+    (let* ((res (edmcp--tools-init-startup-profile (list :file file)))
+           (load-err (plist-get res :load_error)))
+      (should (stringp load-err))
+      (should (string-match-p "edmcp-no-such-package-anywhere-12345"
+                              load-err)))))
 
 (ert-deftest emacs-devtools-mcp-tests/init-batch-timeout-fires-on-hang ()
   "An init that loops forever is killed within the configured timeout."

@@ -163,14 +163,23 @@ returning `[]' for `n=0' would mask a bug in the caller."
           (cl-remove-if #'string-empty-p kept))))))
 
 (defun emacs-devtools-mcp-tools-buffer--warnings-list ()
-  "Return the *Warnings* buffer contents as one string per warning paragraph."
+  "Return the *Warnings* buffer contents as one string per warning paragraph.
+Each paragraph is run through `emacs-devtools-mcp-redact' before
+return so an `auth-source-' / `epg-' / `tramp-' warning cannot
+bypass the redaction layer the way `list-messages' is gated."
   (let ((buf (get-buffer "*Warnings*")))
     (if (not buf)
         '()
       (with-current-buffer buf
         (let* ((all (buffer-substring-no-properties (point-min) (point-max)))
                (paras (split-string all "\n\n" t "[ \t\n]+")))
-          paras)))))
+          (delq nil
+                (mapcar (lambda (p)
+                          (let ((scrubbed (emacs-devtools-mcp-redact p)))
+                            (and scrubbed
+                                 (not (string-empty-p scrubbed))
+                                 scrubbed)))
+                        paras)))))))
 
 (defun edmcp--ert-parse-selector (selector)
   "Parse SELECTOR (a string or nil/t) into an ERT selector value.
@@ -342,11 +351,18 @@ is a list.  Returns a JSON-shaped plist in either branch:
        ,name ,start ,end ,max-bytes))))
 
 (defun edmcp--tools-list-messages (params)
-  "Handler for `list-messages'.  PARAMS is the validated request plist."
+  "Handler for `list-messages'.  PARAMS is the validated request plist.
+A non-positive `:n' is rejected up-front, even when `:cursor' is
+also supplied -- mixing a continuation cursor with a malformed
+`:n' is a caller bug, and silently letting the cursor win would
+mask it (the same silent-clamping pattern that hid `n=0' before
+fix d08804d)."
   (let* ((n (plist-get params :n))
          (cursor (plist-get params :cursor))
          (target (plist-get params :target))
          (page-size emacs-devtools-mcp-buffer-list-page-size)
+         (_ (when (and n (<= n 0))
+              (error "n must be positive, got %d" n)))
          (items (unless cursor
                   (emacs-devtools-mcp-spawn-call
                    target

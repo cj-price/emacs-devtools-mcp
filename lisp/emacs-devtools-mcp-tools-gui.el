@@ -51,8 +51,15 @@
   :group 'emacs-devtools-mcp-tools
   :package-version '(emacs-devtools-mcp . "0.1.0"))
 
-(defcustom emacs-devtools-mcp-screenshot-max-pixels (cons 1920 1080)
+(defcustom emacs-devtools-mcp-screenshot-max-pixels (cons 2560 1600)
   "Soft cap `(WIDTH . HEIGHT)' for screenshots before downscale.
+The pair's product (default 4 096 000) is the actual cap; the
+shape is two numbers so the error message can quote a recognizable
+resolution.  4.1 MP comfortably covers a HiDPI single-monitor
+frame (e.g. 1692x1350 = 2.28 MP, 2880x1800 = 5.18 MP triggers
+the cap deliberately).  Lower this for bandwidth-sensitive
+agents; raise it for very large displays.
+
 Phase 5 honors the cap by refusing to export frames whose pixel
 dimensions exceed this product; downscaling is deferred until the
 spawn-side daemon exists (so a single ImageMagick invocation can

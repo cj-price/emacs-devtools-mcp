@@ -258,10 +258,13 @@ is always stopped."
          (rc (car res))
          (raw (cdr res))
          ;; The result sexp is the last balanced form on stdout; load
-         ;; errors are echoed via princ above and remain in :raw.
+         ;; errors are echoed via princ above and lifted into
+         ;; `:load_error' so a `samples: 0' result is distinguishable
+         ;; from "init crashed before profiling could observe it".
          (parsed-pair (edmcp--tools-init-parse-profile-output raw))
          (parsed (car parsed-pair))
-         (parse-error (cdr parsed-pair)))
+         (parse-error (cdr parsed-pair))
+         (load-error (edmcp--tools-init-extract-load-error raw)))
     (list :file file-real
           :exit_code rc
           :elapsed (or (plist-get parsed :elapsed) 0.0)
@@ -270,7 +273,17 @@ is always stopped."
                 (mapcar #'edmcp--tools-init-redact-top-entry
                         (append (or (plist-get parsed :top) []) nil)))
           :parse_error (if parse-error parse-error :json-false)
+          :load_error (if load-error load-error :json-false)
           :raw (emacs-devtools-mcp-redact raw))))
+
+(defun edmcp--tools-init-extract-load-error (raw)
+  "Return the redacted `LOAD-ERROR' line from RAW, or nil when absent.
+The startup-profile runner wraps the user `load' in a
+`condition-case' that echoes `LOAD-ERROR %S' on failure -- the
+caller can react to a missing package or syntax slip without
+having to grep `:raw'."
+  (when (string-match "^LOAD-ERROR \\(.*\\)$" raw)
+    (emacs-devtools-mcp-redact (match-string 1 raw))))
 
 (defun edmcp--tools-init-redact-top-entry (entry)
   "Redact stringly-typed frames in profile ENTRY before exposing them.

@@ -533,7 +533,12 @@ redacted; see `emacs-devtools-mcp-redact' for the exact patterns."
 (emacs-devtools-mcp-deftool edebug-instrument
     "Mark FUNCTION for edebug stepping.
 The original `symbol-function' value is recorded so
-`edebug-uninstrument' can restore it without re-reading source."
+`edebug-uninstrument' can restore it without re-reading source.
+
+Edebug needs to read FUNCTION's defining sexp from its source
+file -- so a function created by `eval_elisp' or `defalias' with
+no on-disk definition will fail with `Don't know where ... is
+defined'.  Instrument source-defined functions only."
   :cost :fast
   :read-only nil
   :destructive t

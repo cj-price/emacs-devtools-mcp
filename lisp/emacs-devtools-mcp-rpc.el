@@ -84,15 +84,35 @@ always apply; this is purely additive."
   :group 'emacs-devtools-mcp-security
   :package-version '(emacs-devtools-mcp . "0.1.0"))
 
+(defun edmcp--redact-validate-pattern (p)
+  "Verify P is a string and a valid regexp; return P unchanged.
+Signal a clear `user-error' tagging which pattern failed when
+the regexp engine rejects P -- otherwise the failure surfaces deep
+inside the redaction loop on the first tool that produces output,
+which obscures the actual cause (the user's
+`emacs-devtools-mcp-redact-extra-regexps' setting)."
+  (unless (stringp p)
+    (user-error "Redaction pattern is not a string: %S" p))
+  (condition-case err
+      (progn (string-match-p p "") p)
+    (invalid-regexp
+     (user-error "Invalid redaction regexp %S: %s"
+                 p (error-message-string err)))))
+
 (defun emacs-devtools-mcp-redact (string)
   "Return STRING with lines matching any redaction regexp removed.
 Lines are LF-delimited; trailing blank lines are preserved.  Pass
 this around any *Messages*, backtrace, or process-output capture
-before it leaves the host."
+before it leaves the host.  User-supplied patterns in
+`emacs-devtools-mcp-redact-extra-regexps' are validated before
+use; an invalid regexp signals a `user-error' naming the offending
+pattern rather than crashing the redaction loop on first match."
   (if (or (null string) (string-empty-p string))
       string
-    (let* ((patterns (append emacs-devtools-mcp--default-redact-regexps
-                             emacs-devtools-mcp-redact-extra-regexps))
+    (let* ((extras (mapcar #'edmcp--redact-validate-pattern
+                           emacs-devtools-mcp-redact-extra-regexps))
+           (patterns (append emacs-devtools-mcp--default-redact-regexps
+                             extras))
            (re (mapconcat (lambda (p) (concat "\\(?:" p "\\)"))
                           patterns "\\|"))
            (kept nil))
