@@ -237,11 +237,11 @@ and do not appear in the returned vector."
                   (cond
                    ((and (ert-test-result-with-condition-p result)
                          (ert-test-result-with-condition-condition result))
-                    (let ((cond
+                    (let ((c
                            (ert-test-result-with-condition-condition result)))
                       (condition-case nil
-                          (error-message-string cond)
-                        (error (format "%S" cond)))))
+                          (error-message-string c)
+                        (error (format "%S" c)))))
                    (t (format "%s" (type-of result))))))
              (push (list :name (symbol-name (ert-test-name test))
                          :message
