@@ -84,7 +84,8 @@ handle string from a registered handle whose daemon happens to be dead."
               (pcase (plist-get dropped :kill-status)
                 ('killed "killed")
                 ('already-dead "already_dead")
-                ('attached "attached"))))))
+                ('attached "attached")
+                (_ "unknown"))))))
          (already-gone (string= status "already_dead")))
     (list :ok t
           :handle handle
