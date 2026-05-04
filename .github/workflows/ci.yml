@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Emacs ${{ matrix.emacs_version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        emacs_version: ['30.1']
+
+    steps:
+      - name: Check out
+        # actions/checkout v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Emacs ${{ matrix.emacs_version }}
+        # purcell/setup-emacs master @ 2026-04-25
+        uses: purcell/setup-emacs@bdc64dc730ae1fcba200bfd52cb1b4cf6159cbe5
+        with:
+          version: ${{ matrix.emacs_version }}
+
+      - name: Install system tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb socat jq
+
+      - name: Install Elisp dependencies
+        run: |
+          emacs --batch \
+            --eval "(progn \
+                      (require 'package) \
+                      (add-to-list 'package-archives \
+                                   '(\"gnu\" . \"https://elpa.gnu.org/packages/\")) \
+                      (add-to-list 'package-archives \
+                                   '(\"nongnu\" . \"https://elpa.nongnu.org/nongnu/\")) \
+                      (package-initialize) \
+                      (package-refresh-contents) \
+                      (dolist (p '(transient)) \
+                        (unless (package-installed-p p) \
+                          (package-install p))))"
+
+      - name: make all
+        run: |
+          # GNU ELPA installs to ~/.config/emacs/elpa; expose those via EXTRA_LOAD.
+          ELPA_LOAD=$(emacs --batch --eval \
+            "(princ (mapconcat (lambda (d) (concat \"-L \" d)) \
+                                (directory-files package-user-dir t \"^[^.]\") \
+                                \" \"))")
+          make EXTRA_LOAD="$ELPA_LOAD" all
+
+      - name: make test-mcp
+        run: |
+          ELPA_LOAD=$(emacs --batch --eval \
+            "(princ (mapconcat (lambda (d) (concat \"-L \" d)) \
+                                (directory-files package-user-dir t \"^[^.]\") \
+                                \" \"))")
+          make EXTRA_LOAD="$ELPA_LOAD" test-mcp

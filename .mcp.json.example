@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "emacs-devtools": {
+      "command": "/path/to/emacs-devtools-mcp/bin/emacs-devtools-mcp",
+      "env": {
+        "EDMCP_NAME": "default"
+      }
+    }
+  }
+}

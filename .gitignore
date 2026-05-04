@@ -1,0 +1,19 @@
+*.elc
+*.eln
+eln-cache/
+/result
+/result-*
+.direnv/
+.envrc.local
+
+# Editor scratch
+.\#*
+\#*\#
+*~
+
+# Test artifacts
+/test/tmp/
+/test/*.log
+
+# Local Claude Code state
+/.claude/
