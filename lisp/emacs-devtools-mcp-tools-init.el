@@ -31,7 +31,6 @@
 (require 'jsonrpc)
 (require 'emacs-devtools-mcp)
 (require 'emacs-devtools-mcp-rpc)
-(require 'emacs-devtools-mcp-server)
 (require 'emacs-devtools-mcp-auth)
 (require 'emacs-devtools-mcp-spawn)
 

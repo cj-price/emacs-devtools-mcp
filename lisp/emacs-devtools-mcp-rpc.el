@@ -34,30 +34,6 @@
   "MCP framing or transport error"
   'jsonrpc-error)
 
-(defun emacs-devtools-mcp-random-hex (n-bytes)
-  "Return a hex string of N-BYTES bytes drawn from `/dev/urandom'.
-Used for both the per-launch auth token and pagination cursor
-identifiers.  Reads through `head -c N-BYTES /dev/urandom' because
-`insert-file-contents-literally' silently returns zero bytes on
-character devices when given a BEG/END range.  Falls back silently
-to `random' only if the subprocess fails or returns short -- on
-Linux/BSD/macOS the primary path always succeeds, and the
-fallback is correctness-equivalent (only the entropy source
-weakens), so a *Warnings* entry on every fallback was pure noise."
-  (or (ignore-errors
-        (with-temp-buffer
-          (set-buffer-multibyte nil)
-          (let* ((default-directory "/")
-                 (rc (call-process "head" nil (list (current-buffer) nil) nil
-                                   "-c" (number-to-string n-bytes)
-                                   "/dev/urandom"))
-                 (bytes (buffer-string)))
-            (when (and (eq rc 0) (= (length bytes) n-bytes))
-              (mapconcat (lambda (b) (format "%02x" b)) bytes "")))))
-      (let ((s (make-string n-bytes 0)))
-        (dotimes (i n-bytes) (aset s i (random 256)))
-        (mapconcat (lambda (b) (format "%02x" b)) s ""))))
-
 (defconst emacs-devtools-mcp--default-redact-regexps
   '("^[ \t(]*auth-source-"
     "^[ \t(]*epg-"

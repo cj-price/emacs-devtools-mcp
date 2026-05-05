@@ -13,7 +13,7 @@
 ;; Tools route through `emacs-devtools-mcp-spawn-call' so the same
 ;; code paths run on host and (eventually) subordinate Emacsen.
 ;; Pagination uses the cursor store from
-;; `emacs-devtools-mcp-server.el'; redaction is applied to any
+;; `emacs-devtools-mcp.el'; redaction is applied to any
 ;; *Messages*-derived surface.
 
 ;;; Code:
@@ -25,7 +25,6 @@
 (require 'jsonrpc)
 (require 'emacs-devtools-mcp)
 (require 'emacs-devtools-mcp-rpc)
-(require 'emacs-devtools-mcp-server)
 (require 'emacs-devtools-mcp-spawn)
 
 (defcustom emacs-devtools-mcp-buffer-list-page-size 50

@@ -9,14 +9,27 @@
 
 ;;; Commentary:
 
-;; Entry point for the emacs-devtools-mcp package.  Defines the
-;; customization group and version constant.  Tool registration,
-;; transport, and dispatcher live in sibling files and are loaded as
-;; their respective stories land.
+;; Package entry point.  Holds the customization groups, the tool
+;; registry, the `emacs-devtools-mcp-deftool' macro, the JSON Schema
+;; validator, the pagination cursor store, the shared
+;; `emacs-devtools-mcp-target-schema' constant, the
+;; `emacs-devtools-mcp-random-hex' entropy helper (shared by the
+;; cursor store and the auth subsystem), and the
+;; `emacs-devtools-mcp--load-tools' helper that requires every
+;; `tools-<domain>' file on demand.  Transport
+;; (`emacs-devtools-mcp-server') and tool subsystems
+;; (`emacs-devtools-mcp-tools-<domain>') depend on this file; this
+;; file depends on no other package file, so the dependency graph is
+;; a DAG with the umbrella at the root.
 
 ;;; Code:
 
-(defconst emacs-devtools-mcp-version "0.1.0"
+;; Internal short alias: edmcp-- (this file only).
+
+(require 'cl-lib)
+(require 'jsonrpc)
+
+(defconst emacs-devtools-mcp-version "0.1.1"
   "Current version of the `emacs-devtools-mcp' package.")
 
 (defgroup emacs-devtools-mcp nil
@@ -46,17 +59,346 @@
   :group 'emacs-devtools-mcp
   :prefix "emacs-devtools-mcp-")
 
-;; Auto-load the tool subsystems whose code is unconditional (no
-;; external runtime deps).  Tool subsystems that hit X11 / spawn
-;; gates load lazily as their stories land.
-(eval-after-load 'emacs-devtools-mcp-server
-  '(progn
-     (require 'emacs-devtools-mcp-tools-eval)
-     (require 'emacs-devtools-mcp-tools-buffer)
-     (require 'emacs-devtools-mcp-tools-keys)
-     (require 'emacs-devtools-mcp-tools-gui)
-     (require 'emacs-devtools-mcp-tools-spawn)
-     (require 'emacs-devtools-mcp-tools-init)))
+(defcustom emacs-devtools-mcp-slow-tool-timeout 25
+  "Seconds a `:slow' tool may run before its handler is forced to error out."
+  :type 'natnum
+  :group 'emacs-devtools-mcp-tools
+  :package-version '(emacs-devtools-mcp . "0.1.0"))
+
+(defcustom emacs-devtools-mcp-max-response-bytes (* 256 1024)
+  "Hard cap on a single tool result's encoded JSON size, in bytes.
+Exceeding this yields a `payload_too_large' content envelope so the
+client always receives a structured error instead of a giant payload.
+Image-bearing responses use `emacs-devtools-mcp-max-image-response-bytes'
+instead, since base64-encoded screenshots routinely exceed 256 KiB."
+  :type 'natnum
+  :group 'emacs-devtools-mcp-tools
+  :package-version '(emacs-devtools-mcp . "0.1.0"))
+
+(defcustom emacs-devtools-mcp-max-image-response-bytes (* 8 1024 1024)
+  "Hard cap, in bytes, for tool responses that include an MCP `image' block.
+A 1080p PNG screenshot at default resolution base64-encodes to
+~2--3 MiB; the 256 KiB text cap would refuse those by default,
+making `screenshot-frame' unusable.  Applies whenever any element
+of the response's `:content' vector has `:type \"image\"'."
+  :type 'natnum
+  :group 'emacs-devtools-mcp-tools
+  :package-version '(emacs-devtools-mcp . "0.1.0"))
+
+(defcustom emacs-devtools-mcp-cursor-ttl-seconds 300
+  "Seconds an unused pagination cursor token remains valid before reaping."
+  :type 'natnum
+  :group 'emacs-devtools-mcp-tools
+  :package-version '(emacs-devtools-mcp . "0.1.0"))
+
+(defvar emacs-devtools-mcp--cursors (make-hash-table :test 'equal)
+  "Map of opaque cursor token (string) to (TIMESTAMP . CONTINUATION).
+TIMESTAMP is the `float-time' value when the cursor was created.
+CONTINUATION is opaque to this module: tools store and re-fetch
+their own iterator state.")
+
+(defvar emacs-devtools-mcp--tool-registry (make-hash-table :test 'equal)
+  "Hash mapping snake_case tool name (string) to a record plist.
+A record carries: :name, :doc, :cost, :read-only, :destructive,
+:idempotent, :schema, :handler.  The handler stored here is the
+post-`:slow'-wrapping function ready to call on validated params.")
+
+(defconst emacs-devtools-mcp-target-schema
+  '(:description
+    "Where to run the tool.  Always an object, never a bare string.
+`{\"host\": true}' (the default when omitted) routes to the user's
+running Emacs -- whichever PID hosts this MCP server.  `{\"spawn\":
+\"<HANDLE>\"}' routes to a subordinate Emacs previously created by
+`spawn_emacs' or registered by `attach_emacs'; the handle is the
+opaque string returned in those tools' results.  No other shapes
+are accepted -- a string, a `{\"spawn\": true}', or a
+`{\"server_name\": ...}' all fail schema validation."
+    :oneOf [(:type "object"
+             :properties ((host . (:const t)))
+             :required ["host"]
+             :description "Run on the user's Emacs (the MCP server host).")
+            (:type "object"
+             :properties ((spawn . (:type "string")))
+             :required ["spawn"]
+             :description "Run on the spawn handle returned by `spawn_emacs'/`attach_emacs'.")])
+  "JSON Schema fragment shared by every tool's `target' parameter.
+Splice it into a tool's `:properties' alist with backquote-comma
+syntax, e.g. `(target . ,emacs-devtools-mcp-target-schema), so
+every tool advertises the same canonical host/spawn `:oneOf'
+shape.  The validator handles vector arrays uniformly via
+`edmcp--as-list'.")
+
+(defun emacs-devtools-mcp-random-hex (n-bytes)
+  "Return a hex string of N-BYTES bytes drawn from `/dev/urandom'.
+Used for both the per-launch auth token and pagination cursor
+identifiers.  Reads through `head -c N-BYTES /dev/urandom' because
+`insert-file-contents-literally' silently returns zero bytes on
+character devices when given a BEG/END range.  Falls back silently
+to `random' only if the subprocess fails or returns short -- on
+Linux/BSD/macOS the primary path always succeeds, and the
+fallback is correctness-equivalent (only the entropy source
+weakens), so a *Warnings* entry on every fallback was pure noise."
+  (or (ignore-errors
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (let* ((default-directory "/")
+                 (rc (call-process "head" nil (list (current-buffer) nil) nil
+                                   "-c" (number-to-string n-bytes)
+                                   "/dev/urandom"))
+                 (bytes (buffer-string)))
+            (when (and (eq rc 0) (= (length bytes) n-bytes))
+              (mapconcat (lambda (b) (format "%02x" b)) bytes "")))))
+      (let ((s (make-string n-bytes 0)))
+        (dotimes (i n-bytes) (aset s i (random 256)))
+        (mapconcat (lambda (b) (format "%02x" b)) s ""))))
+
+;;;; Tool registry + schema validator + `deftool' macro.
+
+(defun edmcp--type-ok-p (type-name instance)
+  "Return non-nil when TYPE-NAME admits INSTANCE.
+TYPE-NAME is a string drawn from {string, integer, number,
+boolean, null, array, object}.  INSTANCE follows the wire
+mapping of `jsonrpc--json-encode' for booleans and nulls:
+t / :json-false / nil."
+  (pcase type-name
+    ("string"  (stringp instance))
+    ("integer" (integerp instance))
+    ("number"  (numberp instance))
+    ("boolean" (or (eq instance t) (eq instance :json-false)))
+    ("null"    (null instance))
+    ("array"   (vectorp instance))
+    ("object"
+     (or (null instance)
+         (and (listp instance)
+              (zerop (% (length instance) 2))
+              (cl-loop for k in instance by #'cddr
+                       always (keywordp k)))))
+    (_ (error "Unknown JSON Schema type: %S" type-name))))
+
+(defun edmcp--as-list (x)
+  "Coerce sequence X to a list, leaving lists untouched.
+JSON arrays must be vectors at the wire (so `json-serialize'
+treats them as arrays rather than objects), but the validator and
+docstrings think in lists.  Use this at every consumption point."
+  (cond ((null x) nil)
+        ((listp x) x)
+        ((vectorp x) (append x nil))
+        (t (list x))))
+
+(defun edmcp--schema-types (schema)
+  "Return SCHEMA's `:type' as a list of strings, or nil when absent."
+  (let ((ty (plist-get schema :type)))
+    (cond ((null ty) nil)
+          ((stringp ty) (list ty))
+          (t (edmcp--as-list ty)))))
+
+(defun edmcp--prop-keyword (key)
+  "Convert KEY from a `:properties' alist entry to a plist keyword.
+KEY may be a keyword, a symbol, or a string."
+  (cond ((keywordp key) key)
+        ((symbolp key) (intern (concat ":" (symbol-name key))))
+        ((stringp key) (intern (concat ":" key)))
+        (t (signal 'wrong-type-argument (list 'symbol-or-string key)))))
+
+(defun edmcp--prop-name (key)
+  "Stringify KEY (symbol/keyword/string) for diagnostics and JSON I/O."
+  (cond ((keywordp key) (substring (symbol-name key) 1))
+        ((symbolp key) (symbol-name key))
+        (t key)))
+
+(defun emacs-devtools-mcp--validate (schema instance &optional path)
+  "Check SCHEMA against INSTANCE at PATH.
+SCHEMA is a JSON Schema subset; INSTANCE is the parsed value to
+check.  PATH is the recursion accumulator -- a list of string
+segments naming the location relative to the original input.
+Return nil on success or `(REASON . FAILING-PATH)' on the first
+failure."
+  (or
+   (when (plist-member schema :const)
+     (let ((c (plist-get schema :const)))
+       (unless (equal instance c)
+         (cons (format "expected const %S, got %S" c instance) path))))
+   (when (plist-member schema :enum)
+     (let ((e (edmcp--as-list (plist-get schema :enum))))
+       (unless (member instance e)
+         (cons (format "value %S not in enum" instance) path))))
+   (when (plist-member schema :oneOf)
+     (let ((alts (edmcp--as-list (plist-get schema :oneOf)))
+           (matched 0))
+       (dolist (alt alts)
+         (unless (emacs-devtools-mcp--validate alt instance path)
+           (cl-incf matched)))
+       (cond ((zerop matched)
+              (cons "no oneOf alternative matched" path))
+             ((> matched 1)
+              (cons "matched multiple oneOf alternatives" path)))))
+   (let ((types (edmcp--schema-types schema)))
+     (when types
+       (unless (cl-some (lambda (ty) (edmcp--type-ok-p ty instance)) types)
+         (cons (format "expected type %S, got %S" types instance) path))))
+   (when (or (member "object" (edmcp--schema-types schema))
+             (plist-member schema :properties)
+             (plist-member schema :required))
+     (or
+      (cl-some
+       (lambda (req)
+         (let* ((name (edmcp--prop-name req))
+                (kw (edmcp--prop-keyword req)))
+           (unless (plist-member instance kw)
+             (cons (format "missing required property %s" name)
+                   (append path (list name))))))
+       (edmcp--as-list (plist-get schema :required)))
+      (cl-some
+       (lambda (entry)
+         (let* ((name (edmcp--prop-name (car entry)))
+                (kw (edmcp--prop-keyword (car entry)))
+                (sub (cdr entry)))
+           (when (plist-member instance kw)
+             (emacs-devtools-mcp--validate sub
+                                           (plist-get instance kw)
+                                           (append path (list name))))))
+       (plist-get schema :properties))))))
+
+(defun emacs-devtools-mcp--tool-record (name)
+  "Return the record plist for tool NAME, or nil if unregistered."
+  (gethash name emacs-devtools-mcp--tool-registry))
+
+(defun emacs-devtools-mcp--register-tool (record)
+  "Register RECORD (a tool plist).  Refuse to overwrite an existing entry."
+  (let ((name (plist-get record :name)))
+    (when (gethash name emacs-devtools-mcp--tool-registry)
+      (error "Tool already registered: %s" name))
+    (puthash name record emacs-devtools-mcp--tool-registry)
+    name))
+
+(defmacro emacs-devtools-mcp-deftool (name docstring &rest body)
+  "Define MCP tool NAME with DOCSTRING.
+BODY is a property list with the following keys (all optional
+unless noted):
+
+  :cost          `:fast' (default) or `:slow'.  `:slow' wraps the
+                 handler in `while-no-input' + `with-timeout',
+                 with the deadline taken from
+                 `emacs-devtools-mcp-slow-tool-timeout'.
+  :read-only     boolean; surfaced as MCP `readOnlyHint'.
+  :destructive   boolean; surfaced as MCP `destructiveHint'.
+  :idempotent    boolean; surfaced as MCP `idempotentHint'.
+  :schema        JSON Schema subset for the tool's params.
+  :handler       *required* function of one argument PARAMS plist
+                 returning the tool's MCP result.
+
+The tool name on the wire is NAME with kebab-case dashes mapped
+to underscores."
+  (declare (indent 2) (doc-string 2))
+  (let* ((cost (or (plist-get body :cost) :fast))
+         (read-only (plist-get body :read-only))
+         (destructive (plist-get body :destructive))
+         (idempotent (plist-get body :idempotent))
+         (schema (plist-get body :schema))
+         (handler (plist-get body :handler))
+         (name-str (symbol-name name))
+         (snake (replace-regexp-in-string "-" "_" name-str))
+         (slow-wrap-sym (make-symbol "edmcp-slow-result")))
+    (unless handler
+      (error "deftool: %s missing :handler" name))
+    (unless (memq cost '(:fast :slow))
+      (error "deftool: %s :cost must be :fast or :slow, got %S" name cost))
+    (let ((effective
+           (if (eq cost :slow)
+               `(lambda (params)
+                  (let ((,slow-wrap-sym
+                         (while-no-input
+                           (with-timeout
+                               (emacs-devtools-mcp-slow-tool-timeout
+                                (jsonrpc-error
+                                 :code -32000
+                                 :message "Tool execution timed out"))
+                             (funcall ,handler params)))))
+                    (when (eq ,slow-wrap-sym t)
+                      (jsonrpc-error :code -32000
+                                     :message "Tool execution interrupted"))
+                    ,slow-wrap-sym))
+             handler)))
+      `(progn
+         (emacs-devtools-mcp--register-tool
+          (list :name ,snake
+                :doc ,docstring
+                :cost ,cost
+                :read-only ',read-only
+                :destructive ',destructive
+                :idempotent ',idempotent
+                :schema ,schema
+                :handler ,effective))
+         ',name))))
+
+;;;; Pagination cursor store.
+
+(defun emacs-devtools-mcp--cursor-cleanup ()
+  "Drop expired entries from `emacs-devtools-mcp--cursors'."
+  (let ((cutoff (- (float-time) emacs-devtools-mcp-cursor-ttl-seconds))
+        (dead nil))
+    (maphash (lambda (k v) (when (< (car v) cutoff) (push k dead)))
+             emacs-devtools-mcp--cursors)
+    (dolist (k dead)
+      (remhash k emacs-devtools-mcp--cursors))))
+
+(defun emacs-devtools-mcp--cursor-store (continuation)
+  "Persist CONTINUATION under a fresh cursor token; return the token."
+  (emacs-devtools-mcp--cursor-cleanup)
+  (let ((token (emacs-devtools-mcp-random-hex 16)))
+    (puthash token (cons (float-time) continuation)
+             emacs-devtools-mcp--cursors)
+    token))
+
+(defun emacs-devtools-mcp--cursor-fetch (token)
+  "Pop CONTINUATION for TOKEN.  Return nil if missing or expired."
+  (emacs-devtools-mcp--cursor-cleanup)
+  (let ((entry (gethash token emacs-devtools-mcp--cursors)))
+    (when entry
+      (remhash token emacs-devtools-mcp--cursors)
+      (cdr entry))))
+
+(defun emacs-devtools-mcp--paginate (items page-size cursor)
+  "Slice ITEMS by PAGE-SIZE under CURSOR; return (PAGE NEXT-CURSOR-OR-NIL).
+ITEMS is the full list when CURSOR is nil; otherwise the cursor's
+saved tail is used and ITEMS is ignored.  PAGE-SIZE is a positive
+integer.  When more entries remain after the page, a fresh cursor
+is allocated for the tail and returned in the second slot.
+
+A non-nil CURSOR that misses the cursor store -- because it was
+never issued, has been consumed by an earlier call, or has aged
+out past `emacs-devtools-mcp-cursor-ttl-seconds' -- signals a
+JSON-RPC `-32602' error rather than silently returning an empty
+page.  An empty page would be indistinguishable from end-of-results
+and would leave the caller convinced their iteration completed."
+  (let* ((tail (if cursor
+                   (or (emacs-devtools-mcp--cursor-fetch cursor)
+                       (jsonrpc-error
+                        :code -32602
+                        :message
+                        (format "Invalid or expired cursor: %S (cursors expire after %d s)"
+                                cursor
+                                emacs-devtools-mcp-cursor-ttl-seconds)))
+                 items))
+         (page (cl-subseq tail 0 (min page-size (length tail))))
+         (rest (nthcdr (length page) tail))
+         (next (when rest (emacs-devtools-mcp--cursor-store rest))))
+    (list page next)))
+
+(defun emacs-devtools-mcp--load-tools ()
+  "Require every tool subsystem.
+Tool files are not auto-loaded by `(require \\='emacs-devtools-mcp)'
+because that would force every consumer of the umbrella to pay for
+loading every tool subsystem regardless of whether they ever start
+the server.  `emacs-devtools-mcp-server-start' and the spawn
+bootstrap argv each call this helper at the moment they actually
+need tools registered."
+  (require 'emacs-devtools-mcp-tools-eval)
+  (require 'emacs-devtools-mcp-tools-buffer)
+  (require 'emacs-devtools-mcp-tools-keys)
+  (require 'emacs-devtools-mcp-tools-gui)
+  (require 'emacs-devtools-mcp-tools-spawn)
+  (require 'emacs-devtools-mcp-tools-init))
 
 (provide 'emacs-devtools-mcp)
 ;;; emacs-devtools-mcp.el ends here

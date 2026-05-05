@@ -205,7 +205,7 @@ that reference `emacs-devtools-mcp-tools-*' functions fail with
                                         "load-path")))))))
     (list "-L" dir
           "--eval" "(require 'emacs-devtools-mcp)"
-          "--eval" "(require 'emacs-devtools-mcp-server)")))
+          "--eval" "(emacs-devtools-mcp--load-tools)")))
 
 (defun edmcp--spawn-start-bg-daemon (server-name extra-args)
   "Run `emacs -Q --bg-daemon=SERVER-NAME EXTRA-ARGS' synchronously.

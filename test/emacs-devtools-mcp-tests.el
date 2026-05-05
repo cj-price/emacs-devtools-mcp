@@ -484,6 +484,84 @@ in an `emacs-devtools-mcp-rpc-connection'."
               (should (string-match-p "\"method\":\"hello\"" wire))))
         (when (process-live-p client) (delete-process client))))))
 
+(ert-deftest emacs-devtools-mcp-tests/tool-files-load-from-fresh-emacs ()
+  "Each tool file `require's cleanly from a bare `emacs -Q --batch'.
+Regression: every tool file used to `require' the server, while
+`emacs-devtools-mcp-server' fired an `eval-after-load' on its own
+feature that re-required the tool file mid-load -- recursing back
+in before the tool file had run its own `provide', whereupon the
+outer load errored on a duplicate `Tool already registered' call.
+The structural fix lifted the registry, the
+`emacs-devtools-mcp-deftool' macro, and the `--load-tools' helper
+into the package umbrella `emacs-devtools-mcp.el' so tool files no
+longer depend on the server at all.  This test pins that DAG:
+any future maintainer who reintroduces a cycle (or an
+`eval-after-load' that re-enters a still-loading file) breaks
+this test before it ships.  See also
+`tool-files-do-not-require-server', which pins the *requires* in
+each tool file independently of load-time behavior."
+  :tags '(:fresh-daemon)
+  (let* ((lisp-dir (file-name-directory
+                    (locate-library "emacs-devtools-mcp")))
+         (tool-features '(emacs-devtools-mcp-tools-eval
+                          emacs-devtools-mcp-tools-buffer
+                          emacs-devtools-mcp-tools-keys
+                          emacs-devtools-mcp-tools-gui
+                          emacs-devtools-mcp-tools-spawn
+                          emacs-devtools-mcp-tools-init)))
+    (dolist (feat tool-features)
+      (with-temp-buffer
+        (let ((rc (call-process
+                   emacs-devtools-mcp-spawn-emacs-program
+                   nil t nil
+                   "-Q" "--batch"
+                   "-L" lisp-dir
+                   "--eval" (format "(require '%s)" feat))))
+          (let ((output (buffer-string)))
+            (should (zerop rc))
+            (should-not (string-match-p "Tool already registered" output))
+            (should-not
+             (string-match-p "Symbol.s function definition is void" output))))))))
+
+(ert-deftest emacs-devtools-mcp-tests/tool-files-do-not-require-server ()
+  "No tool file `require's `emacs-devtools-mcp-server'.
+This is the structural invariant: the umbrella owns the tool
+registry + macro, so tool files have no reason to depend on the
+server transport.  A grep-level pin catches a maintainer who
+re-adds the require even if the load happens to succeed -- which
+`tool-files-load-from-fresh-emacs' would NOT catch -- because the
+cycle only manifested under specific load orderings."
+  :tags '(:fast)
+  (let ((lisp-dir (file-name-directory
+                   (locate-library "emacs-devtools-mcp")))
+        (tool-files '("emacs-devtools-mcp-tools-eval.el"
+                      "emacs-devtools-mcp-tools-buffer.el"
+                      "emacs-devtools-mcp-tools-keys.el"
+                      "emacs-devtools-mcp-tools-gui.el"
+                      "emacs-devtools-mcp-tools-spawn.el"
+                      "emacs-devtools-mcp-tools-init.el")))
+    (dolist (rel tool-files)
+      (let* ((path (expand-file-name rel lisp-dir))
+             (body (with-temp-buffer
+                     (insert-file-contents path)
+                     (buffer-string))))
+        (should-not
+         (string-match-p
+          "(require[[:space:]]+'emacs-devtools-mcp-server)"
+          body))))))
+
+(ert-deftest emacs-devtools-mcp-tests/load-tools-is-idempotent ()
+  "Calling `emacs-devtools-mcp--load-tools' twice does not error.
+A second invocation must short-circuit on `(featurep ...)' and
+not re-register tools (which would error on
+`Tool already registered').  Pins the contract that the host
+server's `start' path and the spawn bootstrap argv can both call
+this freely without coordinating ordering."
+  :tags '(:fast)
+  (emacs-devtools-mcp--load-tools)
+  (emacs-devtools-mcp--load-tools)
+  (should (gethash "spawn_emacs" emacs-devtools-mcp--tool-registry)))
+
 ;;;; ___Auth___
 ;;
 ;; Per-launch token + first-frame initialize gate.
@@ -2149,10 +2227,11 @@ Regression: every `target: {\"spawn\": \"<handle>\"}' tool call
 went out as a `(emacs-devtools-mcp-tools-*-...)' form to a daemon
 launched with `emacs -Q', which had never loaded any of those
 modules; emacsclient came back with `void-function'.  The
-bootstrap argv adds the package directory to `load-path' and
-`require's both `emacs-devtools-mcp' and
-`emacs-devtools-mcp-server', the latter triggering the
-eval-after-load chain that pulls in every tool subsystem."
+bootstrap argv adds the package directory to `load-path',
+`require's the umbrella `emacs-devtools-mcp', and calls
+`emacs-devtools-mcp--load-tools' to pull in every tool subsystem.
+The subordinate does not load `emacs-devtools-mcp-server' itself,
+since it never listens on a socket."
   :tags '(:fast)
   (let* ((args (edmcp--spawn-bootstrap-args)))
     (should (member "-L" args))
@@ -2161,9 +2240,6 @@ eval-after-load chain that pulls in every tool subsystem."
       (should (file-directory-p dir))
       (should (file-exists-p
                (expand-file-name "emacs-devtools-mcp.el" dir))))
-    ;; Both modules are explicitly required.  The host package's
-    ;; `eval-after-load 'emacs-devtools-mcp-server' chain takes care
-    ;; of pulling in the tool subsystems once `-server' loads.
     (should (cl-find-if (lambda (s)
                           (and (stringp s)
                                (string-match-p
@@ -2172,8 +2248,16 @@ eval-after-load chain that pulls in every tool subsystem."
     (should (cl-find-if (lambda (s)
                           (and (stringp s)
                                (string-match-p
-                                "(require 'emacs-devtools-mcp-server)" s)))
-                        args))))
+                                "(emacs-devtools-mcp--load-tools)" s)))
+                        args))
+    ;; The subordinate is the eval target, not a server host -- it
+    ;; should never load `emacs-devtools-mcp-server'.
+    (should-not (cl-find-if
+                 (lambda (s)
+                   (and (stringp s)
+                        (string-match-p
+                         "(require 'emacs-devtools-mcp-server)" s)))
+                 args))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-start-bg-daemon-injects-bootstrap ()
   "`edmcp--spawn-start-bg-daemon' actually wires the bootstrap argv in.
@@ -2733,12 +2817,17 @@ the package in the subordinate, which is a separate enhancement."
          (ignore-errors (emacs-devtools-mcp-spawn-kill handle)))))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-real-bootstrap-loads-package ()
-  "Spawned daemons have `emacs-devtools-mcp' preloaded via bootstrap argv.
+  "Subordinate daemons load umbrella + tools but NOT the server transport.
 Bug-2 regression test: previously the subordinate `emacs -Q' came
 up bare, so any tool needing package symbols (like
 `emacs-devtools-mcp-redact') failed in spawn but worked on host.
-The bootstrap now appends `-L LISP-DIR --eval (require ...)' to
-the daemon argv so package-aware code paths reach parity."
+The bootstrap now appends `-L LISP-DIR --eval (require ...) --eval
+(emacs-devtools-mcp--load-tools)' to the daemon argv so every tool
+subsystem reaches parity with host.  This test pins the entire
+bootstrap surface live: umbrella loaded, every tool feature loaded,
+server transport intentionally NOT loaded (the subordinate never
+listens on a socket; the host MCP server proxies tool calls in via
+`emacsclient --eval'), and a package-defined function callable."
   :tags '(:daemon)
   (skip-unless (emacs-devtools-mcp-tests--daemon-available-p))
   (emacs-devtools-mcp-tests--with-empty-handles
@@ -2749,8 +2838,26 @@ the daemon argv so package-aware code paths reach parity."
          (progn
            (should (eq t (emacs-devtools-mcp-spawn-call
                           target '(featurep 'emacs-devtools-mcp))))
+           ;; The subordinate intentionally does NOT load
+           ;; `emacs-devtools-mcp-server' -- it never listens on a
+           ;; socket; the host MCP server proxies tool calls in via
+           ;; `emacsclient --eval'.  Asserting absence pins the
+           ;; bootstrap to the minimal surface.
+           (should (eq nil (emacs-devtools-mcp-spawn-call
+                            target '(featurep 'emacs-devtools-mcp-server))))
+           ;; Tool subsystems must be loaded too: spawn-call routes
+           ;; tool handlers like `emacs-devtools-mcp-tools-eval--run'
+           ;; through the subordinate, so they must be defined there.
+           (dolist (feat '(emacs-devtools-mcp-tools-eval
+                           emacs-devtools-mcp-tools-buffer
+                           emacs-devtools-mcp-tools-keys
+                           emacs-devtools-mcp-tools-gui
+                           emacs-devtools-mcp-tools-spawn
+                           emacs-devtools-mcp-tools-init))
+             (should (eq t (emacs-devtools-mcp-spawn-call
+                            target `(featurep ',feat)))))
            (should (eq t (emacs-devtools-mcp-spawn-call
-                          target '(featurep 'emacs-devtools-mcp-server))))
+                          target '(fboundp 'emacs-devtools-mcp-tools-eval--run))))
            ;; A package-defined symbol is callable -- redact strips
            ;; auth-source-* lines, which is a function the host suite
            ;; covers in :fast tests.  Asserting it works *in the
@@ -4755,15 +4862,7 @@ is set or when the subordinate cannot create a graphical frame
                    `(condition-case err
                         (progn
                           (add-to-list 'load-path ,lisp-dir)
-                          ;; Require `-server' first so its
-                          ;; `eval-after-load' fires cleanly and
-                          ;; loads `-tools-gui' end-to-end.  Going
-                          ;; direct via `(require 'tools-gui)' would
-                          ;; recursively re-enter the load before the
-                          ;; final `provide' and double-register every
-                          ;; deftool.
                           (require 'emacs-devtools-mcp)
-                          (require 'emacs-devtools-mcp-server)
                           (require 'emacs-devtools-mcp-tools-gui)
                           (setq emacs-devtools-mcp-tools-gui--host-backend
                                 nil)

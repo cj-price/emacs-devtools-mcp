@@ -27,7 +27,6 @@
 (require 'jsonrpc)
 (require 'emacs-devtools-mcp)
 (require 'emacs-devtools-mcp-rpc)
-(require 'emacs-devtools-mcp-server)
 (require 'emacs-devtools-mcp-spawn)
 
 (defcustom emacs-devtools-mcp-handles-page-size 50

@@ -34,7 +34,6 @@
 (require 'jsonrpc)
 (require 'emacs-devtools-mcp)
 (require 'emacs-devtools-mcp-rpc)
-(require 'emacs-devtools-mcp-server)
 (require 'emacs-devtools-mcp-spawn)
 
 ;; `x-export-frames' is defined in C (xfns.c) only when Emacs is built
