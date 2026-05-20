@@ -21,9 +21,24 @@
 ;;
 ;; Daemons are started with `emacs -Q --bg-daemon=NAME' (no init), or
 ;; `-Q --bg-daemon=NAME -l INIT' when the agent supplies an init file
-;; that passes `emacs-devtools-mcp-auth-validate-init-path'.  Headless
-;; mode (Xvfb) is gated for a follow-up; passing `:headless t' raises
-;; a structured error so the gap is visible to clients.
+;; that passes `emacs-devtools-mcp-auth-validate-init-path'.
+;;
+;; The spawned daemon's display environment is controlled by the
+;; `:display-mode' keyword (also `display_mode' on the wire):
+;;   `host-inherit' -- default; the daemon inherits `process-environment'
+;;                     unchanged, so its `DISPLAY' is whatever the host
+;;                     was launched with.
+;;   `none'         -- `DISPLAY' and `WAYLAND_DISPLAY' are scrubbed for
+;;                     the launch, so the daemon is guaranteed not to
+;;                     reach any X server even if the host has one.
+;;   `xvfb-run'     -- prefixed with `xvfb-run -a' so the daemon gets a
+;;                     private virtual X display; `screenshot_frame'
+;;                     against the spawn can then succeed without the
+;;                     host needing a graphical Emacs build.  This mode
+;;                     uses `--fg-daemon' under `make-process' because
+;;                     `xvfb-run' tears down its X server as soon as
+;;                     its child exits; a forking `--bg-daemon' would
+;;                     lose the display the moment the parent returns.
 ;;
 ;; Each handle is a 16-character hex token.  The matching server name
 ;; is `edmcp-spawn-<HANDLE>' and is validated against
@@ -86,10 +101,33 @@ and on `kill-emacs-hook'."
   :group 'emacs-devtools-mcp-spawn
   :package-version '(emacs-devtools-mcp . "0.1.0"))
 
+(defcustom emacs-devtools-mcp-spawn-default-display-mode 'host-inherit
+  "Default display mode for `emacs-devtools-mcp-spawn-spawn'.
+One of `host-inherit', `none', or `xvfb-run'.  `host-inherit'
+preserves today's behavior: the daemon inherits the host's
+`DISPLAY' and can or cannot reach an X server depending on what
+the host has.  `none' scrubs `DISPLAY' and `WAYLAND_DISPLAY' for
+the launch.  `xvfb-run' wraps the launch in `xvfb-run -a' so the
+daemon gets a private virtual X display."
+  :type '(choice (const host-inherit) (const none) (const xvfb-run))
+  :group 'emacs-devtools-mcp-spawn
+  :package-version '(emacs-devtools-mcp . "0.1.0"))
+
+(defcustom emacs-devtools-mcp-spawn-xvfb-run-program
+  (or (executable-find "xvfb-run") "xvfb-run")
+  "Path to the `xvfb-run' binary, used only by the `xvfb-run' display mode.
+Other modes do not invoke this program, so an unset or missing
+value is harmless until a caller requests `xvfb-run' mode."
+  :type 'string
+  :group 'emacs-devtools-mcp-spawn
+  :package-version '(emacs-devtools-mcp . "0.1.0"))
+
 (defvar emacs-devtools-mcp-spawn--handles (make-hash-table :test 'equal)
   "Map of handle string to a record plist.
-Record fields: :handle, :server-name, :pid, :headless, :init,
-:attached, :created, :last-used.")
+Record fields: :handle, :server-name, :pid, :display-mode, :proc,
+:init, :attached, :created, :last-used.  `:proc' is the long-running
+`make-process' object for `xvfb-run' spawns and nil for the
+`call-process'-based modes.")
 
 (defvar emacs-devtools-mcp-spawn--reaper-timer nil
   "Repeating idle reaper timer object, or nil when not installed.")
@@ -137,14 +175,17 @@ cannot inject -- this check exists to keep server-file paths and
 (defun edmcp--spawn-record-public (rec)
   "Project REC into the wire shape used by tool handlers.
 Returns a plist with snake_case keys that round-trips through
-`json-serialize' without surprises."
+`json-serialize' without surprises.  The internal `:proc' field
+\(a `make-process' object) is intentionally not exposed -- it
+cannot be JSON-encoded and is an implementation detail of the
+`xvfb-run' launcher."
   (let* ((last (plist-get rec :last-used))
          (idle (max 0 (round (- (float-time) last))))
          (expires (round (+ last emacs-devtools-mcp-spawn-idle-timeout))))
     (list :handle (plist-get rec :handle)
           :server_name (plist-get rec :server-name)
           :pid (plist-get rec :pid)
-          :headless (if (plist-get rec :headless) t :json-false)
+          :display_mode (symbol-name (plist-get rec :display-mode))
           :attached (if (plist-get rec :attached) t :json-false)
           :idle_seconds idle
           :expires_at expires)))
@@ -207,25 +248,155 @@ that reference `emacs-devtools-mcp-tools-*' functions fail with
           "--eval" "(require 'emacs-devtools-mcp)"
           "--eval" "(emacs-devtools-mcp--load-tools)")))
 
-(defun edmcp--spawn-start-bg-daemon (server-name extra-args)
-  "Run `emacs -Q --bg-daemon=SERVER-NAME EXTRA-ARGS' synchronously.
-The daemon detaches; the parent exits as soon as the fork
-succeeds.  We then call `edmcp--spawn-wait-ready' to confirm the
-daemon is accepting clients.  Returns the daemon PID.  Injects
-the bootstrap argv between the daemon flag and EXTRA-ARGS so the
-package is loaded before any user `-l INIT' runs."
-  (let* ((cmd-args (append (list "-Q" (format "--bg-daemon=%s" server-name))
-                           (edmcp--spawn-bootstrap-args)
-                           extra-args))
-         (res (edmcp--spawn-call-process
-               emacs-devtools-mcp-spawn-emacs-program cmd-args)))
-    (unless (zerop (car res))
+(defconst emacs-devtools-mcp-spawn-display-modes
+  '(host-inherit none xvfb-run)
+  "Valid `:display-mode' symbols accepted by `spawn-emacs'.
+The first element is also the universal default applied when the
+wire field is omitted.  The JSON schema in
+`emacs-devtools-mcp-tools-spawn.el' derives its `:enum' and
+`:default' from this list so the wire contract cannot drift from
+the validator that `edmcp--spawn-resolve-display-mode' consults.")
+
+(defconst edmcp--spawn-display-scrub-env-vars '("DISPLAY" "WAYLAND_DISPLAY")
+  "Env vars removed from `process-environment' when display mode is `none'.")
+
+(defun edmcp--spawn-resolve-display-mode (mode)
+  "Validate MODE and substitute the configured default when nil.
+Signals `emacs-devtools-mcp-spawn-error' on an unknown symbol so
+clients see a structured error rather than a `pcase' fall-through
+later in the launch pipeline."
+  (let ((m (or mode emacs-devtools-mcp-spawn-default-display-mode)))
+    (unless (memq m emacs-devtools-mcp-spawn-display-modes)
       (signal 'emacs-devtools-mcp-spawn-error
-              (list (format "emacs --bg-daemon=%s failed (rc=%d): %s"
-                            server-name
-                            (car res)
-                            (string-trim (cdr res))))))
-    (edmcp--spawn-wait-ready server-name)))
+              (list (format "unknown display-mode: %S" mode))))
+    m))
+
+(defun edmcp--spawn-env-without (vars)
+  "Return a fresh `process-environment' with VARS forced-unset for children.
+Each entry of `process-environment' is normally `NAME=VALUE'; an
+entry of just `NAME' (no `=') is the documented way to mark a
+variable as explicitly unset for child processes.  Emacs's
+`call-process' otherwise re-injects `DISPLAY' from the parent's X
+session even when no matching `DISPLAY=' entry is present, so
+dropping matching entries is necessary but not sufficient -- we
+prepend a bare `NAME' sentinel for each scrubbed var."
+  (let* ((re (concat "\\`\\(?:"
+                     (mapconcat #'regexp-quote vars "\\|")
+                     "\\)="))
+         (filtered nil))
+    (dolist (entry process-environment)
+      (unless (string-match-p re entry)
+        (push entry filtered)))
+    (append vars (nreverse filtered))))
+
+(defun edmcp--spawn-build-argv (mode server-name extra-args)
+  "Return a plist describing how to launch a daemon for MODE.
+SERVER-NAME is the validated daemon name; EXTRA-ARGS is the
+caller-supplied trailing argv (currently `-l INIT' or nil).
+
+Result keys:
+  :program       executable to invoke
+  :args          argv tail after :program
+  :env-removals  env-var names to strip from `process-environment'
+  :async-p       t when the launcher must outlive the daemon (xvfb-run);
+                 nil when the parent fork-exits and `call-process' is
+                 the right tool."
+  (let ((bootstrap (edmcp--spawn-bootstrap-args))
+        (emacs emacs-devtools-mcp-spawn-emacs-program))
+    (pcase mode
+      ('host-inherit
+       (list :program emacs
+             :args (append (list "-Q" (format "--bg-daemon=%s" server-name))
+                           bootstrap extra-args)
+             :env-removals nil
+             :async-p nil))
+      ('none
+       (list :program emacs
+             :args (append (list "-Q" (format "--bg-daemon=%s" server-name))
+                           bootstrap extra-args)
+             :env-removals edmcp--spawn-display-scrub-env-vars
+             :async-p nil))
+      ('xvfb-run
+       (unless (executable-find emacs-devtools-mcp-spawn-xvfb-run-program)
+         (signal 'emacs-devtools-mcp-spawn-error
+                 (list (format "xvfb-run program not found: %s"
+                               emacs-devtools-mcp-spawn-xvfb-run-program))))
+       (list :program emacs-devtools-mcp-spawn-xvfb-run-program
+             :args (append (list "-a" "--" emacs "-Q"
+                                 (format "--fg-daemon=%s" server-name))
+                           bootstrap extra-args)
+             :env-removals nil
+             :async-p t)))))
+
+(defun edmcp--spawn-wrapper-sentinel (proc _event)
+  "Evict the handle whose async wrapper PROC has exited.
+Installed on `xvfb-run'-mode wrappers so a crashed wrapper (Xvfb
+OOM, signal, display-number exhaustion) does not leave a phantom
+record in `emacs-devtools-mcp-spawn--handles' for the reaper to
+discover 30 minutes later.  No-op on the deliberate kill path:
+`emacs-devtools-mcp-spawn-kill' has already removed the entry by
+the time the sentinel fires.  EVENT is ignored -- we trust
+`process-live-p' instead because it covers `exit', `signal', and
+`failed' uniformly."
+  (unless (process-live-p proc)
+    (let (orphan)
+      (maphash (lambda (handle rec)
+                 (when (eq proc (plist-get rec :proc))
+                   (setq orphan handle)))
+               emacs-devtools-mcp-spawn--handles)
+      (when orphan
+        (remhash orphan emacs-devtools-mcp-spawn--handles)
+        (let ((buf (process-buffer proc)))
+          (when (buffer-live-p buf)
+            (ignore-errors (kill-buffer buf))))))))
+
+(defun edmcp--spawn-launch-async (program args server-name)
+  "Start PROGRAM ARGS as a long-running `make-process' wrapper.
+Used by display modes whose launcher must outlive the daemon
+\(currently `xvfb-run').  Returns (cons PID PROC) once SERVER-NAME
+answers; kills PROC and signals on readiness timeout.  Attaches
+`edmcp--spawn-wrapper-sentinel' so an unexpected wrapper exit
+evicts the phantom handle instead of leaving it for the reaper."
+  (let* ((buf (generate-new-buffer
+               (format " *edmcp-spawn-%s*" server-name)))
+         (proc (make-process
+                :name (format "edmcp-spawn-%s" server-name)
+                :buffer buf
+                :command (cons program args)
+                :connection-type 'pipe
+                :stderr buf
+                :sentinel #'edmcp--spawn-wrapper-sentinel
+                :noquery t)))
+    (condition-case err
+        (cons (edmcp--spawn-wait-ready server-name) proc)
+      (error
+       (ignore-errors (kill-process proc))
+       (when (buffer-live-p buf) (ignore-errors (kill-buffer buf)))
+       (signal (car err) (cdr err))))))
+
+(defun edmcp--spawn-launch-daemon (mode server-name extra-args)
+  "Launch a daemon for MODE / SERVER-NAME / EXTRA-ARGS.
+Returns (cons PID PROC) where PROC is the `make-process' object
+for async launchers and nil for sync launchers.  Signals on
+failure or readiness timeout."
+  (let* ((spec (edmcp--spawn-build-argv mode server-name extra-args))
+         (program (plist-get spec :program))
+         (args (plist-get spec :args))
+         (removals (plist-get spec :env-removals))
+         (async-p (plist-get spec :async-p))
+         (process-environment
+          (if removals (edmcp--spawn-env-without removals) process-environment)))
+    (cond
+     (async-p
+      (edmcp--spawn-launch-async program args server-name))
+     (t
+      (let ((res (edmcp--spawn-call-process program args)))
+        (unless (zerop (car res))
+          (signal 'emacs-devtools-mcp-spawn-error
+                  (list (format "%s --bg-daemon=%s failed (rc=%d): %s"
+                                program server-name (car res)
+                                (string-trim (cdr res))))))
+        (cons (edmcp--spawn-wait-ready server-name) nil))))))
 
 (defun edmcp--spawn-ensure-reaper ()
   "Install the 60-second reaper timer if absent."
@@ -253,14 +424,16 @@ launched out-of-band."
 
 (defun emacs-devtools-mcp-spawn-spawn (&rest args)
   "Spawn a subordinate Emacs daemon and return its record plist.
-Recognized keys in ARGS: `:init' (path; allowlist-checked),
-`:headless' (boolean; not yet supported).  The server name is
-always auto-generated as `edmcp-spawn-<HANDLE>' so the reaper
-never touches a daemon owned by the user.  Signals
+Recognized keys in ARGS: `:init' (path; allowlist-checked) and
+`:display-mode' (one of `host-inherit', `none', `xvfb-run'; nil
+falls back to `emacs-devtools-mcp-spawn-default-display-mode').
+The server name is always auto-generated as `edmcp-spawn-<HANDLE>'
+so the reaper never touches a daemon owned by the user.  Signals
 `emacs-devtools-mcp-spawn-error' on validation failure or daemon
 boot timeout."
   (let* ((init (plist-get args :init))
-         (headless (plist-get args :headless))
+         (mode (edmcp--spawn-resolve-display-mode
+                (plist-get args :display-mode)))
          (handle (edmcp--spawn-alloc-handle))
          (server-name (edmcp--spawn-validate-server-name
                        (edmcp--spawn-server-name-for handle))))
@@ -272,17 +445,17 @@ boot timeout."
       (signal 'emacs-devtools-mcp-spawn-error
               (list (format "max-handles (%d) reached"
                             emacs-devtools-mcp-spawn-max-handles))))
-    (when (and headless (not (eq headless :json-false)))
-      (signal 'emacs-devtools-mcp-spawn-error
-              (list "headless mode not yet implemented")))
     (let* ((init-real (and init
                            (emacs-devtools-mcp-auth-validate-init-path init)))
            (extra (when init-real (list "-l" init-real)))
-           (pid (edmcp--spawn-start-bg-daemon server-name extra))
+           (launch (edmcp--spawn-launch-daemon mode server-name extra))
+           (pid (car launch))
+           (proc (cdr launch))
            (rec (list :handle handle
                       :server-name server-name
                       :pid pid
-                      :headless nil
+                      :display-mode mode
+                      :proc proc
                       :init init-real
                       :attached nil
                       :created (float-time)
@@ -330,7 +503,8 @@ dangling against a dead server when the other is killed."
          (rec (list :handle handle
                     :server-name server-name
                     :pid pid
-                    :headless nil
+                    :display-mode 'host-inherit
+                    :proc nil
                     :init nil
                     :attached t
                     :created (float-time)
@@ -344,16 +518,23 @@ dangling against a dead server when the other is killed."
 Returns the dropped record with an extra `:kill-status' field:
   `attached'     -- handle was registered via `spawn-attach'; the
                     user-owned daemon is left running.
-  `killed'       -- `(kill-emacs)' RPC succeeded.
-  `already-dead' -- RPC failed (rc/=0); the daemon was unreachable.
+  `killed'       -- the daemon was terminated (RPC for the sync
+                    launchers, SIGTERM on the wrapper for the async
+                    `xvfb-run' launcher, which also tears down Xvfb).
+  `already-dead' -- the daemon was unreachable (RPC rc/=0 and no
+                    live wrapper process).
 The status surfaces through the public `kill_spawn' tool so a client
 can tell `we never knew about it' apart from `we knew, we tried, it
 was already dead'."
   (let* ((rec (edmcp--spawn-lookup handle))
          (server-name (plist-get rec :server-name))
+         (proc (plist-get rec :proc))
          (status
           (cond
            ((plist-get rec :attached) 'attached)
+           ((and proc (process-live-p proc))
+            (ignore-errors (kill-process proc))
+            'killed)
            (t
             (let ((res (ignore-errors
                          (edmcp--spawn-call-process
@@ -363,6 +544,10 @@ was already dead'."
                   'killed
                 'already-dead))))))
     (remhash handle emacs-devtools-mcp-spawn--handles)
+    (when proc
+      (let ((buf (process-buffer proc)))
+        (when (buffer-live-p buf)
+          (ignore-errors (kill-buffer buf)))))
     (plist-put rec :kill-status status)))
 
 (defun emacs-devtools-mcp-spawn-list ()

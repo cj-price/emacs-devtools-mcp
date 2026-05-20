@@ -2044,7 +2044,7 @@ Restores the original hash on exit so tests don't bleed."
   (emacs-devtools-mcp-tests--with-empty-handles
    (let* ((older (- (float-time) 100))
           (rec (list :handle "h" :server-name "edmcp-spawn-h"
-                     :pid 1 :headless nil :init nil :attached nil
+                     :pid 1 :display-mode 'host-inherit :init nil :attached nil
                      :created older :last-used older)))
      (puthash "h" rec emacs-devtools-mcp-spawn--handles)
      (let ((after (edmcp--spawn-touch "h")))
@@ -2056,11 +2056,11 @@ Restores the original hash on exit so tests don't bleed."
   (emacs-devtools-mcp-tests--with-empty-handles
    (let ((now (float-time)))
      (puthash "bbb" (list :handle "bbb" :server-name "edmcp-spawn-bbb"
-                          :pid 1 :headless nil :init nil :attached nil
+                          :pid 1 :display-mode 'host-inherit :init nil :attached nil
                           :created now :last-used now)
               emacs-devtools-mcp-spawn--handles)
      (puthash "aaa" (list :handle "aaa" :server-name "edmcp-spawn-aaa"
-                          :pid 2 :headless nil :init nil :attached t
+                          :pid 2 :display-mode 'host-inherit :init nil :attached t
                           :created now :last-used now)
               emacs-devtools-mcp-spawn--handles)
      (let ((listed (emacs-devtools-mcp-spawn-list)))
@@ -2068,7 +2068,8 @@ Restores the original hash on exit so tests don't bleed."
        (should (equal "aaa" (plist-get (car listed) :handle)))
        (should (equal "bbb" (plist-get (cadr listed) :handle)))
        (should (equal "edmcp-spawn-aaa" (plist-get (car listed) :server_name)))
-       (should (equal :json-false (plist-get (car listed) :headless)))
+       (should (equal "host-inherit"
+                      (plist-get (car listed) :display_mode)))
        (should (eq t (plist-get (car listed) :attached)))
        (should (integerp (plist-get (car listed) :idle_seconds)))
        (should (integerp (plist-get (car listed) :expires_at)))))))
@@ -2156,7 +2157,7 @@ kill -- so the field is removed from the public schema."
      (cl-letf (((symbol-function 'edmcp--spawn-emacsclient-ping)
                 (lambda (&rest _) (cl-incf probed) 4242)))
        (puthash "h0" (list :handle "h0" :server-name "edmcp-spawn-h0"
-                           :pid 1 :headless nil :init nil :attached nil
+                           :pid 1 :display-mode 'host-inherit :init nil :attached nil
                            :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (let ((err (should-error
@@ -2173,7 +2174,7 @@ kill -- so the field is removed from the public schema."
      (cl-letf (((symbol-function 'edmcp--spawn-call-process)
                 (lambda (&rest _) (cons 0 ""))))
        (puthash "h" (list :handle "h" :server-name "edmcp-spawn-h"
-                          :pid 1 :headless nil :init nil :attached nil
+                          :pid 1 :display-mode 'host-inherit :init nil :attached nil
                           :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (let ((env1 (edmcp--server-tools-call
@@ -2211,14 +2212,201 @@ kill -- so the field is removed from the public schema."
     (plist-get (gethash "kill_spawn" emacs-devtools-mcp--tool-registry) :schema)
     '())))
 
-(ert-deftest emacs-devtools-mcp-tests/spawn-headless-rejected ()
-  "Passing `:headless t' raises `not yet implemented'.  Phase 6 limitation."
+(ert-deftest emacs-devtools-mcp-tests/spawn-display-mode-unknown-rejected ()
+  "An unknown `:display-mode' symbol raises a structured error.
+Catches typos / bad agent input before any process is spawned."
   :tags '(:fast)
   (emacs-devtools-mcp-tests--with-empty-handles
    (let ((err (should-error
-               (emacs-devtools-mcp-spawn-spawn :headless t)
+               (emacs-devtools-mcp-spawn-spawn :display-mode 'bogus)
                :type 'emacs-devtools-mcp-spawn-error)))
-     (should (string-match-p "headless" (cadr err))))))
+     (should (string-match-p "display-mode" (cadr err))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-build-argv-host-inherit ()
+  "Default `host-inherit' mode preserves today's argv shape.
+emacs is the program; argv carries `--bg-daemon=NAME' followed by
+the bootstrap and any caller extras.  No env removals; sync launch."
+  :tags '(:fast)
+  (let ((spec (edmcp--spawn-build-argv 'host-inherit
+                                       "edmcp-spawn-test" '("-l" "/tmp/x.el"))))
+    (should (equal emacs-devtools-mcp-spawn-emacs-program
+                   (plist-get spec :program)))
+    (should (cl-find "--bg-daemon=edmcp-spawn-test"
+                     (plist-get spec :args) :test #'equal))
+    (should (cl-find "-l" (plist-get spec :args) :test #'equal))
+    (should (null (plist-get spec :env-removals)))
+    (should-not (plist-get spec :async-p))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-build-argv-none-scrubs-env ()
+  "Mode `none' shares argv with `host-inherit' but strips DISPLAY/WAYLAND_DISPLAY.
+The daemon is then guaranteed not to reach an X server, regardless
+of what the host's environment carries."
+  :tags '(:fast)
+  (let ((spec (edmcp--spawn-build-argv 'none "edmcp-spawn-test" nil)))
+    (should (equal emacs-devtools-mcp-spawn-emacs-program
+                   (plist-get spec :program)))
+    (should (cl-find "--bg-daemon=edmcp-spawn-test"
+                     (plist-get spec :args) :test #'equal))
+    (should (equal '("DISPLAY" "WAYLAND_DISPLAY")
+                   (plist-get spec :env-removals)))
+    (should-not (plist-get spec :async-p))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-build-argv-xvfb-run-fg-daemon ()
+  "Mode `xvfb-run' wraps the launch and switches to `--fg-daemon'.
+`xvfb-run' tears down its X server when its child exits, so a
+forking `--bg-daemon' would lose the display immediately.  The
+async flag tells the launcher to keep the wrapper alive via
+`make-process'."
+  :tags '(:fast)
+  (skip-unless (executable-find "xvfb-run"))
+  (let ((spec (edmcp--spawn-build-argv 'xvfb-run "edmcp-spawn-test" nil)))
+    (should (equal emacs-devtools-mcp-spawn-xvfb-run-program
+                   (plist-get spec :program)))
+    (let ((args (plist-get spec :args)))
+      (should (member "-a" args))
+      (should (member "--" args))
+      (should (cl-find "--fg-daemon=edmcp-spawn-test" args :test #'equal))
+      (should-not (cl-find-if (lambda (s)
+                                (and (stringp s)
+                                     (string-prefix-p "--bg-daemon=" s)))
+                              args)))
+    (should (plist-get spec :async-p))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-resolve-display-mode-nil-follows-default ()
+  "`edmcp--spawn-resolve-display-mode' substitutes the configured default for nil.
+Cycles the defcustom through each valid value so the binding from
+`emacs-devtools-mcp-spawn-default-display-mode' is the only thing
+selecting the answer."
+  :tags '(:fast)
+  (dolist (m emacs-devtools-mcp-spawn-display-modes)
+    (let ((emacs-devtools-mcp-spawn-default-display-mode m))
+      (should (eq m (edmcp--spawn-resolve-display-mode nil))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-tool-schema-display-mode-accepts-known-and-null ()
+  "`spawn_emacs' schema accepts each enum member, null, and omission."
+  :tags '(:fast)
+  (let ((schema (plist-get
+                 (gethash "spawn_emacs" emacs-devtools-mcp--tool-registry)
+                 :schema)))
+    (should-not (emacs-devtools-mcp--validate schema '()))
+    (should-not (emacs-devtools-mcp--validate schema '(:display_mode nil)))
+    (dolist (m emacs-devtools-mcp-spawn-display-modes)
+      (should-not
+       (emacs-devtools-mcp--validate
+        schema (list :display_mode (symbol-name m)))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-tool-schema-display-mode-rejects-bogus ()
+  "`spawn_emacs' schema rejects an unknown `display_mode' string."
+  :tags '(:fast)
+  (let* ((schema (plist-get
+                  (gethash "spawn_emacs" emacs-devtools-mcp--tool-registry)
+                  :schema))
+         (result (emacs-devtools-mcp--validate
+                  schema '(:display_mode "bogus"))))
+    (should result)
+    (should (member "display_mode" (cdr result)))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-wrapper-sentinel-evicts-phantom ()
+  "Sentinel drops the handle when its wrapper process exits.
+Simulates an Xvfb crash by faking the wrapper as dead and asserting
+`emacs-devtools-mcp-spawn--handles' loses the matching entry."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let* ((proc (start-process "edmcp-test-sentinel" nil
+                               "sh" "-c" "exit 0"))
+          (now (float-time)))
+     (while (process-live-p proc) (sleep-for 0.01))
+     (puthash "ghost" (list :handle "ghost"
+                            :server-name "edmcp-spawn-ghost"
+                            :pid 4242 :display-mode 'xvfb-run :proc proc
+                            :init nil :attached nil
+                            :created now :last-used now)
+              emacs-devtools-mcp-spawn--handles)
+     (edmcp--spawn-wrapper-sentinel proc "exit\n")
+     (should-not (gethash "ghost" emacs-devtools-mcp-spawn--handles)))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-wrapper-sentinel-noop-on-live-proc ()
+  "Sentinel ignores a still-live wrapper so transient signals don't drop handles."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let* ((proc (start-process "edmcp-test-sentinel-live" nil
+                               "sleep" "30"))
+          (now (float-time)))
+     (unwind-protect
+         (progn
+           (puthash "alive" (list :handle "alive"
+                                  :server-name "edmcp-spawn-alive"
+                                  :pid 4242 :display-mode 'xvfb-run :proc proc
+                                  :init nil :attached nil
+                                  :created now :last-used now)
+                    emacs-devtools-mcp-spawn--handles)
+           (edmcp--spawn-wrapper-sentinel proc "signal\n")
+           (should (gethash "alive" emacs-devtools-mcp-spawn--handles)))
+       (ignore-errors (kill-process proc))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-kill-sigterms-live-wrapper ()
+  "`spawn-kill' takes the SIGTERM arm when the record holds a live `:proc'.
+Distinguishes the async `xvfb-run' kill path from the synchronous
+`emacsclient (kill-emacs)' path used by the other display modes."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let* ((proc (start-process "edmcp-test-kill-wrapper" nil
+                               "sleep" "30"))
+          (now (float-time))
+          (rpc-calls 0))
+     (unwind-protect
+         (cl-letf (((symbol-function 'edmcp--spawn-call-process)
+                    (lambda (&rest _) (cl-incf rpc-calls) (cons 0 ""))))
+           (puthash "h" (list :handle "h" :server-name "edmcp-spawn-h"
+                              :pid 4242 :display-mode 'xvfb-run :proc proc
+                              :init nil :attached nil
+                              :created now :last-used now)
+                    emacs-devtools-mcp-spawn--handles)
+           (let ((dropped (emacs-devtools-mcp-spawn-kill "h")))
+             (should (eq 'killed (plist-get dropped :kill-status))))
+           (should (zerop rpc-calls))
+           (should-not (gethash "h" emacs-devtools-mcp-spawn--handles))
+           (let ((deadline (+ (float-time) 2)))
+             (while (and (process-live-p proc) (< (float-time) deadline))
+               (sleep-for 0.05)))
+           (should-not (process-live-p proc)))
+       (ignore-errors (kill-process proc))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-attach-records-host-inherit-and-nil-proc ()
+  "Attaching pins `:display-mode' to `host-inherit' and leaves `:proc' nil.
+The wire shape exposes the mode so callers can see that an attached
+daemon's display environment is whatever the user happened to launch
+it with -- the package never controlled it."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (cl-letf (((symbol-function 'edmcp--spawn-emacsclient-ping)
+              (lambda (&rest _) 4242)))
+     (let ((rec (emacs-devtools-mcp-spawn-attach "edmcp-other-daemon")))
+       (should (eq 'host-inherit (plist-get rec :display-mode)))
+       (should (null (plist-get rec :proc)))
+       (let ((public (edmcp--spawn-record-public rec)))
+         (should (equal "host-inherit" (plist-get public :display_mode))))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-env-without-strips-vars ()
+  "`edmcp--spawn-env-without' drops matching entries and forces them unset.
+Preserves unrelated entries and prepends bare-name sentinels so
+`call-process' will not re-inject `DISPLAY' / `WAYLAND_DISPLAY'
+from the parent's X session."
+  :tags '(:fast)
+  (let ((process-environment '("DISPLAY=:0"
+                               "WAYLAND_DISPLAY=wayland-0"
+                               "PATH=/usr/bin"
+                               "HOME=/tmp")))
+    (let ((stripped (edmcp--spawn-env-without '("DISPLAY" "WAYLAND_DISPLAY"))))
+      (should-not (cl-find-if (lambda (e) (string-prefix-p "DISPLAY=" e))
+                              stripped))
+      (should-not (cl-find-if (lambda (e)
+                                (string-prefix-p "WAYLAND_DISPLAY=" e))
+                              stripped))
+      (should (member "PATH=/usr/bin" stripped))
+      (should (member "HOME=/tmp" stripped))
+      (should (member "DISPLAY" stripped))
+      (should (member "WAYLAND_DISPLAY" stripped)))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-bootstrap-args-load-package ()
   "`edmcp--spawn-bootstrap-args' produces argv that loads the package.
@@ -2259,8 +2447,8 @@ since it never listens on a socket."
                          "(require 'emacs-devtools-mcp-server)" s)))
                  args))))
 
-(ert-deftest emacs-devtools-mcp-tests/spawn-start-bg-daemon-injects-bootstrap ()
-  "`edmcp--spawn-start-bg-daemon' actually wires the bootstrap argv in.
+(ert-deftest emacs-devtools-mcp-tests/spawn-launch-daemon-injects-bootstrap ()
+  "`edmcp--spawn-launch-daemon' actually wires the bootstrap argv in.
 Captures the argv passed to `edmcp--spawn-call-process' and asserts
 the load-path injection appears between the `--bg-daemon' flag and
 any caller-supplied EXTRA-ARGS (so `-l USER-INIT' runs *after* the
@@ -2273,7 +2461,8 @@ package loads)."
                  (cons 0 "")))
               ((symbol-function 'edmcp--spawn-wait-ready)
                (lambda (_n) 4242)))
-      (edmcp--spawn-start-bg-daemon "edmcp-spawn-test" '("-l" "/tmp/x.el")))
+      (edmcp--spawn-launch-daemon 'host-inherit
+                                  "edmcp-spawn-test" '("-l" "/tmp/x.el")))
     (should captured-args)
     (let* ((daemon-pos (cl-position-if
                         (lambda (s) (string-match-p "--bg-daemon=" s))
@@ -2301,7 +2490,7 @@ package loads)."
          (puthash (format "h%d" i)
                   (list :handle (format "h%d" i)
                         :server-name (format "edmcp-spawn-h%d" i)
-                        :pid (+ 1000 i) :headless nil :init nil
+                        :pid (+ 1000 i) :display-mode 'host-inherit :init nil
                         :attached nil :created now :last-used now)
                   emacs-devtools-mcp-spawn--handles))
        (let ((err (should-error
@@ -2429,7 +2618,7 @@ single-arm regression doesn't pass the existing tests."
        (let ((h (format "h%02d" i)))
          (puthash h (list :handle h
                           :server-name (concat "edmcp-spawn-" h)
-                          :pid (+ 1000 i) :headless nil :init nil
+                          :pid (+ 1000 i) :display-mode 'host-inherit :init nil
                           :attached nil :created now :last-used now)
                   emacs-devtools-mcp-spawn--handles)))
      (let* ((p1 (edmcp--tools-spawn-list nil))
@@ -2459,12 +2648,12 @@ single-arm regression doesn't pass the existing tests."
                   (push args kill-calls) (cons 0 ""))))
        (puthash "fresh"
                 (list :handle "fresh" :server-name "edmcp-spawn-fresh"
-                      :pid 1 :headless nil :init nil :attached nil
+                      :pid 1 :display-mode 'host-inherit :init nil :attached nil
                       :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (puthash "stale"
                 (list :handle "stale" :server-name "edmcp-spawn-stale"
-                      :pid 2 :headless nil :init nil :attached nil
+                      :pid 2 :display-mode 'host-inherit :init nil :attached nil
                       :created (- now 1000) :last-used (- now 1000))
                 emacs-devtools-mcp-spawn--handles)
        (edmcp--spawn-reaper-tick)
@@ -2481,7 +2670,7 @@ single-arm regression doesn't pass the existing tests."
      (cl-letf (((symbol-function 'edmcp--spawn-call-process)
                 (lambda (&rest _) (cons 0 ""))))
        (puthash "h1" (list :handle "h1" :server-name "edmcp-spawn-h1"
-                           :pid 1 :headless nil :init nil :attached nil
+                           :pid 1 :display-mode 'host-inherit :init nil :attached nil
                            :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (emacs-devtools-mcp-spawn-kill-all)
@@ -2522,7 +2711,7 @@ murder the user's real Emacs."
                 (lambda (_program args &optional _b)
                   (push args calls) (cons 0 ""))))
        (puthash "att" (list :handle "att" :server-name "user-daemon"
-                            :pid 1 :headless nil :init nil :attached t
+                            :pid 1 :display-mode 'host-inherit :init nil :attached t
                             :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (let ((dropped (emacs-devtools-mcp-spawn-kill "att")))
@@ -2540,7 +2729,7 @@ murder the user's real Emacs."
                 (lambda (_program args &optional _b)
                   (push args calls) (cons 0 ""))))
        (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
-                           :pid 2 :headless nil :init nil :attached nil
+                           :pid 2 :display-mode 'host-inherit :init nil :attached nil
                            :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (let ((dropped (emacs-devtools-mcp-spawn-kill "sp")))
@@ -2559,7 +2748,7 @@ murder the user's real Emacs."
      (cl-letf (((symbol-function 'edmcp--spawn-call-process)
                 (lambda (&rest _) (cons 1 "no daemon"))))
        (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
-                           :pid 3 :headless nil :init nil :attached nil
+                           :pid 3 :display-mode 'host-inherit :init nil :attached nil
                            :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (let ((dropped (emacs-devtools-mcp-spawn-kill "sp")))
@@ -2580,13 +2769,13 @@ to have been registered via `attach_emacs'."
                   (push args calls) (cons 0 ""))))
        (puthash "att-stale"
                 (list :handle "att-stale" :server-name "user-daemon"
-                      :pid 1 :headless nil :init nil :attached t
+                      :pid 1 :display-mode 'host-inherit :init nil :attached t
                       :created (- now 9999) :last-used (- now 9999))
                 emacs-devtools-mcp-spawn--handles)
        (puthash "spawned-stale"
                 (list :handle "spawned-stale"
                       :server-name "edmcp-spawn-spawned-stale"
-                      :pid 2 :headless nil :init nil :attached nil
+                      :pid 2 :display-mode 'host-inherit :init nil :attached nil
                       :created (- now 9999) :last-used (- now 9999))
                 emacs-devtools-mcp-spawn--handles)
        (edmcp--spawn-reaper-tick)
@@ -2613,11 +2802,11 @@ to have been registered via `attach_emacs'."
                 (lambda (_program args &optional _b)
                   (push args calls) (cons 0 ""))))
        (puthash "att" (list :handle "att" :server-name "user-daemon"
-                            :pid 1 :headless nil :init nil :attached t
+                            :pid 1 :display-mode 'host-inherit :init nil :attached t
                             :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
-                           :pid 2 :headless nil :init nil :attached nil
+                           :pid 2 :display-mode 'host-inherit :init nil :attached nil
                            :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (emacs-devtools-mcp-spawn-kill-all)
@@ -2640,7 +2829,7 @@ connect error.  The server name is the daemon's identity; refuse."
      (cl-letf (((symbol-function 'edmcp--spawn-emacsclient-ping)
                 (lambda (&rest _) (cl-incf probed) 4242)))
        (puthash "h0" (list :handle "h0" :server-name "edmcp-spawn-shared"
-                           :pid 1 :headless nil :init nil :attached nil
+                           :pid 1 :display-mode 'host-inherit :init nil :attached nil
                            :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (let ((err (should-error
@@ -2673,7 +2862,7 @@ distinguishable from a registered-but-dead one."
      (cl-letf (((symbol-function 'edmcp--spawn-call-process)
                 (lambda (&rest _) (cons 0 ""))))
        (puthash "live" (list :handle "live" :server-name "edmcp-spawn-live"
-                             :pid 1 :headless nil :init nil :attached nil
+                             :pid 1 :display-mode 'host-inherit :init nil :attached nil
                              :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (let* ((env (edmcp--server-tools-call
@@ -2688,7 +2877,7 @@ distinguishable from a registered-but-dead one."
      (cl-letf (((symbol-function 'edmcp--spawn-call-process)
                 (lambda (&rest _) (cons 1 "no daemon"))))
        (puthash "dead" (list :handle "dead" :server-name "edmcp-spawn-dead"
-                             :pid 2 :headless nil :init nil :attached nil
+                             :pid 2 :display-mode 'host-inherit :init nil :attached nil
                              :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (let* ((env (edmcp--server-tools-call
@@ -2792,6 +2981,28 @@ read those, so revealing existence costs nothing."
      (should-not (gethash handle emacs-devtools-mcp-spawn--handles))
      ;; Daemon should no longer answer.
      (should-not (edmcp--spawn-emacsclient-ping sn)))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-real-display-mode-none-scrubs-display ()
+  "Mode `none' actually scrubs DISPLAY from the spawned daemon's env.
+Sets DISPLAY in the host's `process-environment' for the duration
+of the spawn so the assertion is non-trivial even when the test
+runner inherits no DISPLAY.  The daemon's `(getenv \"DISPLAY\")'
+must come back nil regardless of what the host had set."
+  :tags '(:daemon)
+  (skip-unless (emacs-devtools-mcp-tests--daemon-available-p))
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let* ((process-environment
+           (cons "DISPLAY=:99" process-environment))
+          (rec (emacs-devtools-mcp-spawn-spawn :display-mode 'none))
+          (handle (plist-get rec :handle))
+          (target (list :spawn handle)))
+     (should (eq 'none (plist-get rec :display-mode)))
+     (unwind-protect
+         (let ((daemon-display (emacs-devtools-mcp-spawn-call
+                                target '(getenv "DISPLAY"))))
+           (should (null daemon-display)))
+       (when (gethash handle emacs-devtools-mcp-spawn--handles)
+         (ignore-errors (emacs-devtools-mcp-spawn-kill handle)))))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-real-host-vs-spawn-parity ()
   "Built-in forms produce equal results from `(:host t)' and `(:spawn H)'.
@@ -4897,6 +5108,79 @@ is set or when the subordinate cannot create a graphical frame
                (should (equal "image/png" (plist-get blk :mimeType)))
                (should (stringp b64))
                (should (> (length b64) 200))
+               (should (>= (length decoded) 8))
+               (should (equal (substring decoded 0 8)
+                              "\x89PNG\r\n\x1a\n"))))
+         (when (gethash handle emacs-devtools-mcp-spawn--handles)
+           (ignore-errors (emacs-devtools-mcp-spawn-kill handle))))))))
+
+(ert-deftest emacs-devtools-mcp-tests/screenshot-frame-real-png-via-xvfb-run-spawn ()
+  "End-to-end PNG round-trip when the spawn supplies its own Xvfb.
+Unlike `screenshot-frame-real-png-via-spawn' (which inherits the
+outer test process's DISPLAY), this test demands that
+`display-mode' `xvfb-run' itself stands up a virtual X server for
+the spawned daemon -- so it must work even when the host has no
+DISPLAY at all.  Pins the customer-facing promise: an agent can
+ask for `screenshot_frame' against a spawn without the user's
+Emacs being graphical."
+  :tags '(:gui)
+  (skip-unless (emacs-devtools-mcp-tests--daemon-available-p))
+  (skip-unless (executable-find
+                emacs-devtools-mcp-spawn-xvfb-run-program))
+  (let ((lisp-dir
+         (file-name-directory
+          (or (locate-library "emacs-devtools-mcp-tools-gui")
+              (error "package not on load-path -- run via `make test-gui'")))))
+    (emacs-devtools-mcp-tests--with-empty-handles
+     ;; Scrub DISPLAY from the host's env for this spawn so the
+     ;; assertion really is `xvfb-run created a display'.  Without
+     ;; this, an inherited DISPLAY could mask a broken xvfb-run path.
+     (let* ((process-environment
+             (cl-remove-if (lambda (e)
+                             (or (string-prefix-p "DISPLAY=" e)
+                                 (string-prefix-p "WAYLAND_DISPLAY=" e)))
+                           process-environment))
+            (rec (emacs-devtools-mcp-spawn-spawn :display-mode 'xvfb-run))
+            (handle (plist-get rec :handle))
+            (target (list :spawn handle)))
+       (should (eq 'xvfb-run (plist-get rec :display-mode)))
+       (should (process-live-p (plist-get rec :proc)))
+       (unwind-protect
+           (let ((bootstrap
+                  (emacs-devtools-mcp-spawn-call
+                   target
+                   `(condition-case err
+                        (progn
+                          (add-to-list 'load-path ,lisp-dir)
+                          (require 'emacs-devtools-mcp)
+                          (require 'emacs-devtools-mcp-tools-gui)
+                          (setq emacs-devtools-mcp-tools-gui--host-backend
+                                nil)
+                          (setq emacs-devtools-mcp-screenshot-max-pixels
+                                (cons 4096 4096))
+                          (let ((f (make-frame-on-display
+                                    (getenv "DISPLAY")
+                                    '((name . "edmcp-gui-xvfb-test")
+                                      (width . 40)
+                                      (height . 12)))))
+                            (select-frame f)
+                            t))
+                      (error (cons 'err (error-message-string err)))))))
+             (unless (eq bootstrap t)
+               (ert-skip
+                (format "xvfb-run spawn cannot create graphical frame: %S"
+                        bootstrap)))
+             (let* ((res (edmcp--tools-screenshot-frame
+                          (list :target target)))
+                    (content (plist-get res :content))
+                    (blk (and (vectorp content)
+                              (= 1 (length content))
+                              (aref content 0)))
+                    (b64 (plist-get blk :data))
+                    (decoded (and (stringp b64) (base64-decode-string b64))))
+               (should (equal "image" (plist-get blk :type)))
+               (should (equal "image/png" (plist-get blk :mimeType)))
+               (should (stringp b64))
                (should (>= (length decoded) 8))
                (should (equal (substring decoded 0 8)
                               "\x89PNG\r\n\x1a\n"))))

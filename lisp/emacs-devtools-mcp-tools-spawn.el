@@ -41,11 +41,11 @@ remain."
 (defun edmcp--tools-spawn-spawn (params)
   "Handler for `spawn-emacs'.  PARAMS is the validated request plist."
   (let* ((init (plist-get params :init))
-         (headless-raw (plist-get params :headless))
-         (headless (and headless-raw (not (eq headless-raw :json-false))))
+         (mode-str (plist-get params :display_mode))
+         (mode (and (stringp mode-str) (intern mode-str)))
          (rec (apply #'emacs-devtools-mcp-spawn-spawn
                      (append (when init (list :init init))
-                             (when headless (list :headless t))))))
+                             (when mode (list :display-mode mode))))))
     (edmcp--spawn-record-public rec)))
 
 (defun edmcp--tools-spawn-attach (params)
@@ -105,19 +105,30 @@ handle string from a registered handle whose daemon happens to be dead."
 (emacs-devtools-mcp-deftool spawn-emacs
     "Spawn a subordinate Emacs daemon and return its handle.
 Optional INIT is a path to an init file that must lie under
-`emacs-devtools-mcp-init-allowlist'.  Optional HEADLESS is
-reserved for Xvfb-backed mode and is currently rejected.
-The server name is auto-generated as `edmcp-spawn-<HANDLE>'
-and is not caller-controllable -- this prevents an agent from
-colliding with a daemon owned by the user, which the reaper
-would later kill."
+`emacs-devtools-mcp-init-allowlist'.  Optional DISPLAY_MODE is one
+of `\"host-inherit\"' (default; the daemon inherits the host's
+`DISPLAY'), `\"none\"' (DISPLAY/WAYLAND_DISPLAY scrubbed; daemon
+is guaranteed not to reach an X server), or `\"xvfb-run\"'
+\(wraps the launch in `xvfb-run -a' so the daemon gets a private
+virtual X display).  The server name is auto-generated as
+`edmcp-spawn-<HANDLE>' and is not caller-controllable -- this
+prevents an agent from colliding with a daemon owned by the user,
+which the reaper would later kill."
   :cost :slow
   :read-only nil
   :destructive t
   :idempotent nil
   :schema `(:type "object"
-            :properties ((init     . (:type ["string" "null"]))
-                         (headless . (:type ["boolean" "null"]))))
+            :properties
+            ((init . (:type ["string" "null"]))
+             (display_mode
+              . (:default "host-inherit"
+                 :oneOf
+                 [(:type "string"
+                   :enum ,(apply #'vector
+                                 (mapcar #'symbol-name
+                                         emacs-devtools-mcp-spawn-display-modes)))
+                  (:type "null")]))))
   :handler #'edmcp--tools-spawn-spawn)
 
 (emacs-devtools-mcp-deftool attach-emacs

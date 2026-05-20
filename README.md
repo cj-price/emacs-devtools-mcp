@@ -25,9 +25,10 @@ gives an agent for the browser, but for Emacs.
 
 You need: Emacs ≥30.1, `socat`, and `jq`. Everything except
 `screenshot_frame` works in a TTY or headless daemon; only the screenshot
-tool needs a graphical Emacs build (for `x-export-frames`). `xvfb-run` is
-needed only to run `make test-gui`. The repo ships a `shell.nix` that pins
-all of those.
+tool needs a graphical Emacs build (for `x-export-frames`). `xvfb-run`
+lets you run `make test-gui` and lets `spawn_emacs` start a screenshot-
+capable subordinate daemon via `display_mode: "xvfb-run"`. The repo ships
+a `shell.nix` that pins all of those.
 
 ```sh
 git clone https://github.com/cj-price/emacs-devtools-mcp.git
@@ -91,7 +92,7 @@ return `next_cursor` when more results remain. JSON keys are `snake_case`.
 
 | Tool | Description |
 |---|---|
-| `spawn_emacs` | Start an `emacs -Q --bg-daemon` subordinate; optionally load an init file under the allowlist. Returns `{handle, server_name, pid, expires_at}`. |
+| `spawn_emacs` | Start an `emacs -Q --bg-daemon` subordinate; optionally load an init file under the allowlist. `display_mode` is one of `"host-inherit"` (default; daemon inherits the host's `DISPLAY` and `WAYLAND_DISPLAY` — typically what an interactive Emacs has, headless under TTY hosts), `"none"` (scrubs both for a guaranteed-headless spawn even when the host has a display), or `"xvfb-run"` (wraps the launch in `xvfb-run -a` so `screenshot_frame` works against the spawn). Returns `{handle, server_name, pid, display_mode, idle_seconds, expires_at, attached}`. |
 | `attach_emacs` | Register a daemon you started yourself, by `server_name`. |
 | `list_handles` | Paginated active-handle listing with `idle_seconds` + `expires_at`. |
 | `kill_spawn` | Kill a daemon by handle and forget it. Named `kill_spawn` (not `kill_emacs`) so it cannot be misread as a request to terminate the host. |
@@ -161,6 +162,8 @@ Every user-facing knob is a `defcustom` under the parent
 | `emacs-devtools-mcp-screenshot-max-pixels` | `2560×1600` | Refuse oversize frames. |
 | `emacs-devtools-mcp-spawn-idle-timeout` | `1800` | Reaper kills idle handles after this many seconds. |
 | `emacs-devtools-mcp-spawn-max-handles` | `4` | Cap on simultaneous subordinate daemons. |
+| `emacs-devtools-mcp-spawn-default-display-mode` | `host-inherit` | Default `display_mode` when `spawn_emacs` omits the field. |
+| `emacs-devtools-mcp-spawn-xvfb-run-program` | `xvfb-run` | Path to `xvfb-run`; used for `display_mode: "xvfb-run"` spawns. |
 | `emacs-devtools-mcp-slow-tool-timeout` | `25` | `with-timeout` cap for `:slow` tools. |
 | `emacs-devtools-mcp-bisect-max-probes` | `32` | Hard cap on `bisect_init` iterations. |
 | `emacs-devtools-mcp-init-batch-timeout` | `30` | Per-probe timeout in `emacs --batch`. |

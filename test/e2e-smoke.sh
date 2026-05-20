@@ -241,6 +241,55 @@ else
   call kill_spawn          '{"handle":"unknown-handle"}'
 fi
 
+# --- spawn with display_mode: xvfb-run + screenshot_frame round-trip ---
+# Guarded: only run when xvfb-run is available, since the host CI image
+# may not have it.  This exercises the new path where a *spawn* gets its
+# own X display and `screenshot_frame' against that spawn succeeds even
+# though `screenshot_frame' against the host returned isError above.
+#
+# Sequence: spawn -> eval_elisp creates a real graphical frame inside the
+# spawn on the xvfb-run-provided DISPLAY (and resets the cached backend
+# probe so the next call re-evaluates) -> screenshot_frame against the
+# spawn -> kill_spawn.  Without the frame-creation step, the daemon
+# would report `display-graphic-p' = nil and the backend probe would
+# return `unavailable'.
+if command -v xvfb-run >/dev/null 2>&1; then
+  ID=$((ID + 1))
+  jq -nc --argjson id "$ID" \
+    '{jsonrpc:"2.0", id:$id, method:"tools/call",
+      params:{name:"spawn_emacs",
+              arguments:{display_mode:"xvfb-run"}}}' >&3
+  IFS= read -r -t 30 -u 4 xvfb_spawn_line
+  xvfb_spawn_text="$(jq -r '.result.content[0].text' <<<"$xvfb_spawn_line")"
+  xvfb_handle="$(jq -r '.handle' <<<"$xvfb_spawn_text")"
+  if [ -z "$xvfb_handle" ] || [ "$xvfb_handle" = "null" ]; then
+    printf 'FAIL %-22s body=%s\n' spawn_emacs/xvfb-run "$xvfb_spawn_line"
+    FAIL=$((FAIL + 1)); FAILED_NAMES+=("spawn_emacs/xvfb-run")
+  else
+    printf 'PASS %-22s handle=%s\n' spawn_emacs/xvfb-run "$xvfb_handle"
+    PASS=$((PASS + 1))
+    # Create a graphical frame inside the spawn so `screenshot_frame'
+    # has something to export, and reset the cached backend probe so
+    # the next call re-evaluates `display-graphic-p'.
+    frame_form='(progn
+                  (setq emacs-devtools-mcp-tools-gui--host-backend nil)
+                  (setq emacs-devtools-mcp-screenshot-max-pixels (cons 4096 4096))
+                  (select-frame
+                    (make-frame-on-display (getenv "DISPLAY")
+                                           (quote ((name . "edmcp-e2e-xvfb")
+                                                   (width . 40)
+                                                   (height . 12)))))
+                  t)'
+    call eval_elisp          "$(jq -nc --arg h "$xvfb_handle" --arg f "$frame_form" \
+      '{form:$f, target:{spawn:$h}}')"
+    call screenshot_frame    "$(jq -nc --arg h "$xvfb_handle" \
+      '{target:{spawn:$h}}')"
+    call kill_spawn          "$(jq -nc --arg h "$xvfb_handle" '{handle:$h}')"
+  fi
+else
+  echo "SKIP spawn_emacs/xvfb-run    (xvfb-run not in PATH)"
+fi
+
 # --- Negative case: protocol-level error path through the relay ---
 ID=$((ID + 1))
 jq -nc --argjson id "$ID" \
