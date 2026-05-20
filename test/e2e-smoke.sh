@@ -242,10 +242,12 @@ else
 fi
 
 # --- spawn with display_mode: xvfb-run + screenshot_frame round-trip ---
-# Guarded: only run when xvfb-run is available, since the host CI image
-# may not have it.  This exercises the new path where a *spawn* gets its
-# own X display and `screenshot_frame' against that spawn succeeds even
-# though `screenshot_frame' against the host returned isError above.
+# Guarded: only run when (a) xvfb-run is in PATH and (b) the `emacs'
+# binary was built with X support, since the spawn uses the same
+# binary as the host and a no-X build (e.g. `purcell/nix-emacs-ci',
+# which configures `--with-x=no') cannot create a graphical frame
+# even under xvfb-run -- `make-frame-on-display' errors and the
+# backend probe later reports `unavailable'.
 #
 # Sequence: spawn -> eval_elisp creates a real graphical frame inside the
 # spawn on the xvfb-run-provided DISPLAY (and resets the cached backend
@@ -253,7 +255,14 @@ fi
 # spawn -> kill_spawn.  Without the frame-creation step, the daemon
 # would report `display-graphic-p' = nil and the backend probe would
 # return `unavailable'.
-if command -v xvfb-run >/dev/null 2>&1; then
+emacs_has_x=no
+if emacs --batch -Q --eval \
+     "(kill-emacs (if (fboundp 'x-create-frame) 0 1))" >/dev/null 2>&1; then
+  emacs_has_x=yes
+fi
+if [ "$emacs_has_x" != yes ]; then
+  echo "SKIP spawn_emacs/xvfb-run    (emacs built without X support)"
+elif command -v xvfb-run >/dev/null 2>&1; then
   ID=$((ID + 1))
   jq -nc --argjson id "$ID" \
     '{jsonrpc:"2.0", id:$id, method:"tools/call",
