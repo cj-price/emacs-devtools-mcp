@@ -272,8 +272,10 @@ the validator that `edmcp--spawn-resolve-display-mode' consults.")
 (defun edmcp--spawn-wayland-session-p ()
   "Return non-nil when the host env exposes a live `WAYLAND_DISPLAY'.
 Used by `host-inherit' to decide whether to drop the X11 `DISPLAY'
-from the daemon's env so a `--with-pgtk' Emacs uses Wayland rather
-than opening a crash-prone X11 frame."
+from the daemon's env so a `--with-pgtk' Emacs defaults its frames
+to Wayland rather than opening a crash-prone X11 frame.  This only
+steers the default: a frame explicitly targeted at an X display
+\(e.g. `(make-frame-on-display \":0\")') can still reach X."
   (let ((wd (getenv "WAYLAND_DISPLAY")))
     (and wd (not (string-empty-p wd)))))
 

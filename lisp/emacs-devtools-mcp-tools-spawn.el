@@ -107,10 +107,14 @@ handle string from a registered handle whose daemon happens to be dead."
 Optional INIT is a path to an init file that must lie under
 `emacs-devtools-mcp-init-allowlist'.  Optional DISPLAY_MODE is one
 of `\"host-inherit\"' (default; the daemon inherits the host's
-`DISPLAY'), `\"none\"' (DISPLAY/WAYLAND_DISPLAY scrubbed; daemon
-is guaranteed not to reach an X server), or `\"xvfb-run\"'
-\(wraps the launch in `xvfb-run -a' so the daemon gets a private
-virtual X display).  The server name is auto-generated as
+`DISPLAY' -- except on a Wayland host the X11 `DISPLAY' is dropped,
+`WAYLAND_DISPLAY' kept, so a `--with-pgtk' build defaults its frames
+to Wayland rather than a crash-prone X11 frame; an explicitly
+display-targeted frame can still reach X), `\"none\"'
+\(DISPLAY/WAYLAND_DISPLAY scrubbed; daemon is guaranteed not to reach
+an X server), or `\"xvfb-run\"' (wraps the launch in `xvfb-run -a'
+so the daemon gets a private virtual X display).  The server name
+is auto-generated as
 `edmcp-spawn-<HANDLE>' and is not caller-controllable -- this
 prevents an agent from colliding with a daemon owned by the user,
 which the reaper would later kill."

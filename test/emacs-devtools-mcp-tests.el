@@ -2270,6 +2270,40 @@ sole display, so nothing is removed."
     (let ((spec (edmcp--spawn-build-argv 'host-inherit "edmcp-spawn-test" nil)))
       (should (null (plist-get spec :env-removals))))))
 
+(ert-deftest emacs-devtools-mcp-tests/spawn-build-argv-host-inherit-empty-wayland-keeps-display ()
+  "An empty `WAYLAND_DISPLAY' is not a live Wayland session; `DISPLAY' is kept.
+Guards the `string-empty-p' clause in `edmcp--spawn-wayland-session-p':
+a shell or unit that exports `WAYLAND_DISPLAY=' empty must not be
+mistaken for Wayland and trigger a wrongful `DISPLAY' drop."
+  :tags '(:fast)
+  (let ((process-environment
+         (append '("WAYLAND_DISPLAY=" "DISPLAY=:0")
+                 (cl-remove-if (lambda (e)
+                                 (string-match-p "\\`\\(?:WAYLAND_DISPLAY\\|DISPLAY\\)="
+                                                 e))
+                               process-environment))))
+    (let ((spec (edmcp--spawn-build-argv 'host-inherit "edmcp-spawn-test" nil)))
+      (should (null (plist-get spec :env-removals))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-host-inherit-wayland-env-drops-display-keeps-wayland ()
+  "Composed launch env: Wayland host-inherit drops `DISPLAY', keeps Wayland.
+Wires the conditional `:env-removals' from `edmcp--spawn-build-argv'
+through `edmcp--spawn-env-without' exactly as `edmcp--spawn-launch-daemon'
+binds `process-environment', without spawning a process: `DISPLAY' is
+force-unset via the bare-name sentinel while `WAYLAND_DISPLAY' survives."
+  :tags '(:fast)
+  (let ((process-environment
+         (append '("WAYLAND_DISPLAY=wayland-9" "DISPLAY=:0")
+                 (cl-remove-if (lambda (e)
+                                 (string-match-p "\\`\\(?:WAYLAND_DISPLAY\\|DISPLAY\\)="
+                                                 e))
+                               process-environment))))
+    (let* ((spec (edmcp--spawn-build-argv 'host-inherit "edmcp-spawn-test" nil))
+           (env (edmcp--spawn-env-without (plist-get spec :env-removals))))
+      (should (member "DISPLAY" env))
+      (should-not (cl-find-if (lambda (e) (string-prefix-p "DISPLAY=" e)) env))
+      (should (member "WAYLAND_DISPLAY=wayland-9" env)))))
+
 (ert-deftest emacs-devtools-mcp-tests/spawn-build-argv-none-scrubs-env ()
   "Mode `none' shares argv with `host-inherit' but strips DISPLAY/WAYLAND_DISPLAY.
 The daemon is then guaranteed not to reach an X server, regardless
