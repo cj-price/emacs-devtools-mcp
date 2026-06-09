@@ -2225,10 +2225,16 @@ Catches typos / bad agent input before any process is spawned."
 (ert-deftest emacs-devtools-mcp-tests/spawn-build-argv-host-inherit ()
   "Default `host-inherit' mode preserves today's argv shape.
 emacs is the program; argv carries `--bg-daemon=NAME' followed by
-the bootstrap and any caller extras.  No env removals; sync launch."
+the bootstrap and any caller extras.  Sync launch.  The display
+`WAYLAND_DISPLAY' is cleared here so the argv-shape assertions do
+not depend on the host session type (Wayland-host `DISPLAY'
+dropping is covered by its own test)."
   :tags '(:fast)
-  (let ((spec (edmcp--spawn-build-argv 'host-inherit
-                                       "edmcp-spawn-test" '("-l" "/tmp/x.el"))))
+  (let* ((process-environment
+          (cl-remove-if (lambda (e) (string-match-p "\\`WAYLAND_DISPLAY=" e))
+                        process-environment))
+         (spec (edmcp--spawn-build-argv 'host-inherit
+                                        "edmcp-spawn-test" '("-l" "/tmp/x.el"))))
     (should (equal emacs-devtools-mcp-spawn-emacs-program
                    (plist-get spec :program)))
     (should (cl-find "--bg-daemon=edmcp-spawn-test"
@@ -2236,6 +2242,33 @@ the bootstrap and any caller extras.  No env removals; sync launch."
     (should (cl-find "-l" (plist-get spec :args) :test #'equal))
     (should (null (plist-get spec :env-removals)))
     (should-not (plist-get spec :async-p))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-build-argv-host-inherit-drops-display-on-wayland ()
+  "On a Wayland host `host-inherit' drops the X11 `DISPLAY'.
+A `--with-pgtk' Emacs that opens an X11 frame pops the \"pure-GTK
+under X\" warning and is crash-prone; dropping `DISPLAY' (while
+keeping `WAYLAND_DISPLAY') steers the daemon to Wayland."
+  :tags '(:fast)
+  (let ((process-environment
+         (append '("WAYLAND_DISPLAY=wayland-9" "DISPLAY=:0")
+                 (cl-remove-if (lambda (e)
+                                 (string-match-p "\\`\\(?:WAYLAND_DISPLAY\\|DISPLAY\\)="
+                                                 e))
+                               process-environment))))
+    (let ((spec (edmcp--spawn-build-argv 'host-inherit "edmcp-spawn-test" nil)))
+      (should (equal '("DISPLAY") (plist-get spec :env-removals))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-build-argv-host-inherit-keeps-display-no-wayland ()
+  "Without `WAYLAND_DISPLAY' (pure-X host) `host-inherit' keeps `DISPLAY'.
+The drop is Wayland-host specific; an X-only host must retain its
+sole display, so nothing is removed."
+  :tags '(:fast)
+  (let ((process-environment
+         (cl-remove-if (lambda (e)
+                         (string-match-p "\\`WAYLAND_DISPLAY=" e))
+                       process-environment)))
+    (let ((spec (edmcp--spawn-build-argv 'host-inherit "edmcp-spawn-test" nil)))
+      (should (null (plist-get spec :env-removals))))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-build-argv-none-scrubs-env ()
   "Mode `none' shares argv with `host-inherit' but strips DISPLAY/WAYLAND_DISPLAY.

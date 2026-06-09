@@ -92,7 +92,7 @@ return `next_cursor` when more results remain. JSON keys are `snake_case`.
 
 | Tool | Description |
 |---|---|
-| `spawn_emacs` | Start an `emacs -Q --bg-daemon` subordinate; optionally load an init file under the allowlist. `display_mode` is one of `"host-inherit"` (default; daemon inherits the host's `DISPLAY` and `WAYLAND_DISPLAY` — typically what an interactive Emacs has, headless under TTY hosts), `"none"` (scrubs both for a guaranteed-headless spawn even when the host has a display), or `"xvfb-run"` (wraps the launch in `xvfb-run -a` so `screenshot_frame` works against the spawn). Returns `{handle, server_name, pid, display_mode, idle_seconds, expires_at, attached}`. |
+| `spawn_emacs` | Start an `emacs -Q --bg-daemon` subordinate; optionally load an init file under the allowlist. `display_mode` is one of `"host-inherit"` (default; daemon inherits the host's `DISPLAY` and `WAYLAND_DISPLAY` — typically what an interactive Emacs has, headless under TTY hosts; on a Wayland host the X11 `DISPLAY` is dropped — `WAYLAND_DISPLAY` kept — so a `--with-pgtk` build uses Wayland rather than a crash-prone X11 frame that pops the "pure-GTK under X" warning), `"none"` (scrubs both for a guaranteed-headless spawn even when the host has a display), or `"xvfb-run"` (wraps the launch in `xvfb-run -a` so `screenshot_frame` works against the spawn). Returns `{handle, server_name, pid, display_mode, idle_seconds, expires_at, attached}`. |
 | `attach_emacs` | Register a daemon you started yourself, by `server_name`. |
 | `list_handles` | Paginated active-handle listing with `idle_seconds` + `expires_at`. |
 | `kill_spawn` | Kill a daemon by handle and forget it. Named `kill_spawn` (not `kill_emacs`) so it cannot be misread as a request to terminate the host. |

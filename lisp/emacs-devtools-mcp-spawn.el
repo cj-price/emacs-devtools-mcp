@@ -26,8 +26,14 @@
 ;; The spawned daemon's display environment is controlled by the
 ;; `:display-mode' keyword (also `display_mode' on the wire):
 ;;   `host-inherit' -- default; the daemon inherits `process-environment'
-;;                     unchanged, so its `DISPLAY' is whatever the host
-;;                     was launched with.
+;;                     so its `DISPLAY' is whatever the host was launched
+;;                     with.  Exception: when the host env exposes a live
+;;                     `WAYLAND_DISPLAY', the X11 `DISPLAY' is dropped for
+;;                     the launch (Wayland kept), so a `--with-pgtk' Emacs
+;;                     cannot open an X11 frame -- pgtk under X pops the
+;;                     "pure-GTK under X" warning frame and is crash-prone.
+;;                     Frames default to Wayland; `x-export-frames' (the
+;;                     screenshot backend) works there.
 ;;   `none'         -- `DISPLAY' and `WAYLAND_DISPLAY' are scrubbed for
 ;;                     the launch, so the daemon is guaranteed not to
 ;;                     reach any X server even if the host has one.
@@ -104,9 +110,12 @@ and on `kill-emacs-hook'."
 (defcustom emacs-devtools-mcp-spawn-default-display-mode 'host-inherit
   "Default display mode for `emacs-devtools-mcp-spawn-spawn'.
 One of `host-inherit', `none', or `xvfb-run'.  `host-inherit'
-preserves today's behavior: the daemon inherits the host's
-`DISPLAY' and can or cannot reach an X server depending on what
-the host has.  `none' scrubs `DISPLAY' and `WAYLAND_DISPLAY' for
+mostly preserves today's behavior: the daemon inherits the
+host's `DISPLAY' and can or cannot reach an X server depending on
+what the host has.  Exception: when the host has a live
+`WAYLAND_DISPLAY', the X11 `DISPLAY' is dropped (Wayland kept) so
+a `--with-pgtk' build uses Wayland rather than a crash-prone
+XWayland frame.  `none' scrubs `DISPLAY' and `WAYLAND_DISPLAY' for
 the launch.  `xvfb-run' wraps the launch in `xvfb-run -a' so the
 daemon gets a private virtual X display."
   :type '(choice (const host-inherit) (const none) (const xvfb-run))
@@ -260,6 +269,14 @@ the validator that `edmcp--spawn-resolve-display-mode' consults.")
 (defconst edmcp--spawn-display-scrub-env-vars '("DISPLAY" "WAYLAND_DISPLAY")
   "Env vars removed from `process-environment' when display mode is `none'.")
 
+(defun edmcp--spawn-wayland-session-p ()
+  "Return non-nil when the host env exposes a live `WAYLAND_DISPLAY'.
+Used by `host-inherit' to decide whether to drop the X11 `DISPLAY'
+from the daemon's env so a `--with-pgtk' Emacs uses Wayland rather
+than opening a crash-prone X11 frame."
+  (let ((wd (getenv "WAYLAND_DISPLAY")))
+    (and wd (not (string-empty-p wd)))))
+
 (defun edmcp--spawn-resolve-display-mode (mode)
   "Validate MODE and substitute the configured default when nil.
 Signals `emacs-devtools-mcp-spawn-error' on an unknown symbol so
@@ -308,7 +325,11 @@ Result keys:
        (list :program emacs
              :args (append (list "-Q" (format "--bg-daemon=%s" server-name))
                            bootstrap extra-args)
-             :env-removals nil
+             ;; On a Wayland host, drop the X11 `DISPLAY' (keeping
+             ;; `WAYLAND_DISPLAY') so a `--with-pgtk' daemon cannot open an
+             ;; X11 frame -- pgtk under X pops the "pure-GTK under X" warning
+             ;; and is crash-prone.  See `edmcp--spawn-wayland-session-p'.
+             :env-removals (when (edmcp--spawn-wayland-session-p) '("DISPLAY"))
              :async-p nil))
       ('none
        (list :program emacs
