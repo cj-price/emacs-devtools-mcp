@@ -2092,6 +2092,40 @@ content past the reader; the pre-scan treats it like `#.'."
               :type 'emacs-devtools-mcp-spawn-error)))
     (should (string-match-p "rejected" (cadr err)))))
 
+(ert-deftest emacs-devtools-mcp-tests/spawn-parse-reply-rejects-reader-labels ()
+  "`#N='/`#N#' reader labels in a reply are rejected before `read'.
+Labels are the only way `read' can build shared or circular
+structure, which expands ~2^N in `json-serialize' / the error
+printer.  Rejecting them at the scan keeps the parsed value a
+tree whose serialized size is linear in the input.  The amplifier
+DAG itself is sub-kilobyte, so this is the load-bearing defense."
+  :tags '(:fast)
+  ;; A 20-level shared-structure DAG: ~234 bytes of input, ~2 MB when
+  ;; printed uncapped.  Must be refused, not parsed.
+  (let ((dag-text
+         (let ((s "#1=0") (k 1))
+           (while (< k 20)
+             (setq k (1+ k))
+             (setq s (format "#%d=(%s . #%d#)" k s (1- k))))
+           (concat s "\n"))))
+    (dolist (raw (list dag-text
+                       "#1=(:loop . #1#)\n"
+                       "(:shared #2=[1 2] :again #2#)\n"))
+      (let ((err (should-error (edmcp--spawn-parse-reply raw)
+                               :type 'emacs-devtools-mcp-spawn-error)))
+        (should (string-match-p "rejected" (cadr err)))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-parse-reply-allows-radix-and-plain ()
+  "The label scan does not over-reject `#'-prefixed non-label syntax.
+`#16rFF' (radix) and `#xFF' read as plain integers; a label-free
+plist round-trips.  Guards against the `#N=' pattern accidentally
+swallowing legitimate sharp-syntax."
+  :tags '(:fast)
+  (should (= 255 (edmcp--spawn-parse-reply "#16rFF\n")))
+  (should (= 255 (edmcp--spawn-parse-reply "#xFF\n")))
+  (should (equal '(:a 1 :b "two")
+                 (edmcp--spawn-parse-reply "(:a 1 :b \"two\")\n"))))
+
 (ert-deftest emacs-devtools-mcp-tests/spawn-parse-reply-rejects-macro-inside-string ()
   "The scan is position-blind: `#.'/`#@' anywhere in a reply is rejected.
 This pins the deliberate trade-off -- a legitimate reply whose

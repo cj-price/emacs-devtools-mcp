@@ -54,13 +54,13 @@
 ;;
 ;; The eval round-trip routes through `emacsclient -s NAME --eval
 ;; STR'.  STR is built via `prin1-to-string' over an explicit argv
-;; list -- never a shell.  The daemon's reply is pre-scanned for the
-;; `#.' read-time eval reader macro (and `#@', for parity with the
-;; agent-input scanners) and rejected if present, so a compromised or
-;; buggy daemon cannot drive code execution in the host through the
-;; `read' that decodes the reply.  The decoded value is JSON-
-;; serialized, never funcalled; the residual amplification risk from a
-;; shared/circular reply is bounded by the error-path print caps.
+;; list -- never a shell.  The daemon's reply is pre-scanned for
+;; unsafe reader syntax and rejected if present, so a compromised or
+;; buggy daemon cannot drive code execution in the host (via `#.')
+;; through the `read' that decodes the reply, nor smuggle a
+;; shared/circular structure (via `#N=' reader labels) that would
+;; amplify ~2^N when the value is JSON-serialized or its error is
+;; printed.  See `edmcp--spawn-unsafe-reader-re'.
 
 ;;; Code:
 
@@ -598,32 +598,46 @@ was already dead'."
 
 (add-hook 'kill-emacs-hook #'emacs-devtools-mcp-spawn-kill-all)
 
-(defconst edmcp--spawn-unsafe-reader-re "#[.@]"
-  "Matches the `#.' and `#@' reader macros in raw daemon output.
+(defconst edmcp--spawn-unsafe-reader-re "#\\(?:[.@]\\|[0-9]+[=#]\\)"
+  "Matches the unsafe reader syntax we refuse in raw daemon output.
+Three constructs are rejected:
+
 `#.' is the load-bearing case: it is read-time `eval', and Emacs
 `read' has no documented switch to inhibit it, so a reply
-carrying `#.' could execute code in the host.  `#@COUNT' (skip
-COUNT characters) executes nothing, but is rejected too, for
-parity with the agent-input scanners in
+carrying `#.' could execute code in the host.
+
+`#@COUNT' (skip COUNT characters) executes nothing, but is
+rejected too, for parity with the agent-input scanners in
 `emacs-devtools-mcp-tools-init' / `-tools-buffer' and as
 defense-in-depth against a reply desynchronizing the reader.
-This scan is deliberately position-blind and does not claim to
-stop every hostile construct: reader labels (`#N='/`#N#') and
-byte-code literals (`#[') pass through.  Those are not code-
-execution vectors here -- the parsed value is JSON-serialized,
-never funcalled -- and the only residual risk, a shared/circular
-structure amplifying when printed, is bounded separately by the
-print caps on the error path (see `edmcp--server-error-text').")
+
+`#N='/`#N#' reader labels are the only way `read' can build a
+shared or circular structure; without them the parsed value is a
+tree whose printed and JSON-serialized size is linear in the
+input.  A labeled DAG instead expands ~2^N, so a sub-kilobyte
+reply could blow up `json-serialize' (success path) or
+`error-message-string' (error path) and exhaust host memory.
+Rejecting the labels closes that amplifier at the source; the
+print caps in `edmcp--server-error-text' remain as a backstop.
+
+Byte-code literals (`#[') still pass -- they are never funcalled
+here and `json-serialize' refuses them outright, so they reach
+only the (now bounded) error path, not an amplifier.  The scan is
+position-blind: the rare reply whose printed value merely
+contains one of these sequences inside a string is rejected
+rather than parsed selectively.")
 
 (defun edmcp--spawn-parse-reply (raw)
   "Parse RAW emacsclient reply text into the corresponding Lisp value.
-Pre-scans for the `#.' and `#@' reader macros and refuses to call
-`read' on a reply that contains either.  Distinguishes truly
-empty input (\"empty reply\") from input that begins parsing but
-fails (\"unreadable\")."
+Pre-scans for unsafe reader syntax (`#.', `#@', and `#N='/`#N#'
+reader labels) and refuses to call `read' on a reply that
+contains any of them -- see `edmcp--spawn-unsafe-reader-re'.
+Distinguishes truly empty input (\"empty reply\") from input that
+begins parsing but fails (\"unreadable\")."
   (when (string-match-p edmcp--spawn-unsafe-reader-re raw)
     (signal 'emacs-devtools-mcp-spawn-error
-            (list "rejected `#.'/`#@' in daemon reply" (string-trim raw))))
+            (list "rejected unsafe reader syntax in daemon reply"
+                  (string-trim raw))))
   (when (or (null raw) (string-empty-p (string-trim raw)))
     (signal 'emacs-devtools-mcp-spawn-error
             (list "empty reply from emacsclient")))
@@ -643,8 +657,8 @@ fails (\"unreadable\")."
 HANDLE selects the daemon record; FORM is serialized via
 `prin1-to-string' and passed as a single argv element to
 `emacsclient' -- no shell, no quoting hazards.  The reply is
-filtered through `edmcp--spawn-parse-reply' which rejects the
-`#.' and `#@' reader macros before calling `read'."
+filtered through `edmcp--spawn-parse-reply' which rejects unsafe
+reader syntax (`#.', `#@', `#N='/`#N#') before calling `read'."
   (let* ((rec (edmcp--spawn-lookup handle))
          (server-name (plist-get rec :server-name))
          (form-str
@@ -671,7 +685,8 @@ TARGET is nil, `(:host t)', or `(:spawn HANDLE)'.  When TARGET
 selects host, FORM is evaluated lexically in the running Emacs.
 When TARGET selects a spawn handle, FORM is sent to that
 subordinate Emacs over `emacsclient --eval' and the reply is
-parsed after pre-scanning for the `#.' and `#@' reader macros."
+parsed after pre-scanning for unsafe reader syntax (`#.', `#@',
+and `#N='/`#N#' reader labels)."
   (cond
    ((or (null target) (plist-get target :host))
     (eval form t))
