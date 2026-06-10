@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.0
+;; Package-Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -98,7 +98,7 @@ pattern rather than crashing the redaction loop on first match."
 (defclass emacs-devtools-mcp-rpc-connection (jsonrpc-connection)
   ((-process
     :initarg :process
-    :accessor edmcp--rpc-process
+    :accessor emacs-devtools-mcp-rpc--process
     :documentation "Underlying process whose stdio carries the framed JSON.")
    (-on-shutdown
     :initarg :on-shutdown
@@ -122,13 +122,13 @@ SLOTS is the initarg plist supplied to `make-instance'."
     (unless (processp proc)
       (signal 'emacs-devtools-mcp-rpc-error
               (list ":process must be a live process object")))
-    (setf (edmcp--rpc-process conn) proc)
+    (setf (emacs-devtools-mcp-rpc--process conn) proc)
     (set-process-buffer proc
                         (get-buffer-create
                          (format " *%s output*" (or name "edmcp-rpc"))))
     (set-process-coding-system proc 'utf-8-unix 'utf-8-unix)
-    (set-process-filter proc #'edmcp--rpc-process-filter)
-    (set-process-sentinel proc #'edmcp--rpc-process-sentinel)
+    (set-process-filter proc #'emacs-devtools-mcp-rpc--process-filter)
+    (set-process-sentinel proc #'emacs-devtools-mcp-rpc--process-sentinel)
     (with-current-buffer (process-buffer proc)
       (buffer-disable-undo)
       (let ((inhibit-read-only t)) (erase-buffer))
@@ -162,7 +162,7 @@ the rest reach the wire via `jsonrpc-convert-to-endpoint'."
     (when (string-search "\n" json)
       (signal 'emacs-devtools-mcp-rpc-error
               (list "MCP framing forbids embedded LF in encoded JSON" json)))
-    (process-send-string (edmcp--rpc-process connection)
+    (process-send-string (emacs-devtools-mcp-rpc--process connection)
                          (concat json "\n"))
     (jsonrpc--event connection 'client
                     :json json
@@ -173,20 +173,20 @@ the rest reach the wire via `jsonrpc-convert-to-endpoint'."
 (cl-defmethod jsonrpc-running-p
   ((conn emacs-devtools-mcp-rpc-connection))
   "Return non-nil when CONN's underlying process is still live."
-  (let ((proc (edmcp--rpc-process conn)))
+  (let ((proc (emacs-devtools-mcp-rpc--process conn)))
     (and proc (process-live-p proc))))
 
 (cl-defmethod jsonrpc-shutdown
   ((conn emacs-devtools-mcp-rpc-connection) &optional cleanup)
   "Tear down CONN, deleting its process.
 With non-nil CLEANUP, also kill the process buffer."
-  (let ((proc (edmcp--rpc-process conn)))
+  (let ((proc (emacs-devtools-mcp-rpc--process conn)))
     (when (and proc (process-live-p proc))
       (delete-process proc))
     (when (and cleanup proc (buffer-live-p (process-buffer proc)))
       (kill-buffer (process-buffer proc)))))
 
-(defun edmcp--rpc-process-sentinel (proc _change)
+(defun emacs-devtools-mcp-rpc--process-sentinel (proc _change)
   "Sentinel for the underlying PROC of an MCP RPC connection.
 Cancels outstanding continuations and runs the connection's
 `-on-shutdown' callback when PROC exits.  _CHANGE is unused."
@@ -206,7 +206,7 @@ Cancels outstanding continuations and runs the connection's
       (ignore-errors
         (funcall (edmcp--rpc-on-shutdown conn) conn)))))
 
-(defun edmcp--rpc-process-filter (proc string)
+(defun emacs-devtools-mcp-rpc--process-filter (proc string)
   "Process filter for an MCP RPC connection.
 PROC is the underlying process and STRING is the freshly received
 chunk.  Append STRING to PROC's output buffer, then dispatch every

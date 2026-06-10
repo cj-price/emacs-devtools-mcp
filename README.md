@@ -12,7 +12,7 @@ gives an agent for the browser, but for Emacs.
 ## What you can ask an agent to do
 
 - *"My modeline shows the wrong color for unsaved buffers — verify it."*
-  Agent calls `screenshot_frame`, `face-at`, `color_contrast`.
+  Agent calls `screenshot_frame`, `face_at`, `color_contrast`.
 - *"My init.el started taking 4 seconds to load yesterday. Find the culprit."*
   Agent calls `bisect_init` or `startup_profile`.
 - *"Why is `C-c C-c` running the wrong command in this buffer?"*
@@ -46,6 +46,19 @@ To make the server part of your Emacs:
 ;; (emacs-devtools-mcp-server-stop) to shut it down.
 ```
 
+Two platform notes:
+
+- The server requires `XDG_RUNTIME_DIR` (standard on Linux; macOS and
+  most BSDs do not set it). Without it `emacs-devtools-mcp-server-start`
+  signals a `user-error` — which, placed bare in your init, aborts the
+  rest of init loading. Either export the variable to a private
+  mode-0700 directory you own before launching Emacs, or guard the call:
+  `(when (getenv "XDG_RUNTIME_DIR") (emacs-devtools-mcp-server-start))`.
+- After `git pull`, re-run `make all`. The `lisp/` directory contains
+  byte-compiled `.elc` files, and Emacs silently prefers a stale `.elc`
+  over a newer `.el` unless `load-prefer-newer` is non-nil — so without
+  a rebuild your running server is still the old code.
+
 ### Verify it works
 
 End-to-end smoke against a fresh subordinate Emacs (no host attach
@@ -76,6 +89,14 @@ absolute path of `bin/emacs-devtools-mcp`:
 Other clients use the same `command` + `env` shape under their own
 configuration key.
 
+`EDMCP_NAME` selects the socket at `${XDG_RUNTIME_DIR}/edmcp/<NAME>.sock`
+and must match the host's `emacs-devtools-mcp-server-name` (both default
+to `"default"`). If you customize one, customize both — a mismatch shows
+up as the relay reporting `no socket at .../default.sock`.
+
+`make install` symlinks the relay to `~/.local/bin/emacs-devtools-mcp`
+if you'd rather keep the repo path out of your client config.
+
 ## Tool catalog
 
 All tools accept an optional `target` (`{"host": true}` default or
@@ -101,10 +122,37 @@ return `next_cursor` when more results remain. JSON keys are `snake_case`.
 
 | Tool | Description |
 |---|---|
-| `eval_elisp` | Evaluate FORM in `target` and return its printed value plus the *Messages* delta and any error. |
+| `eval_elisp` | Evaluate FORM in `target` and return its printed value plus the *Messages* delta and any error. Optional `answers` (see below) pre-answers interactive prompts; without it, a form that prompts for input (`y-or-n-p`, `read-string`, even `recursive-edit`) is cut off by the slow-tool timeout and returns a `-32000` error; the session stays usable. |
 | `edebug_instrument` / `edebug_uninstrument` | Mark a function for `edebug` stepping; restore. |
 | `capture_backtrace` | Evaluate FORM and return the backtrace at signal time, tail-truncated and redacted. |
 | `trace_function` / `untrace_function` / `trace_log` | `trace-function-foreground` round-trip, with paginated log readout. |
+
+**Answering interactive prompts.** `eval_elisp` takes an optional
+`answers` array, consumed in prompt order: booleans answer
+`y-or-n-p`/`yes-or-no-p`, strings answer `read-string`/
+`read-from-minibuffer` (and therefore `completing-read` and
+`read-file-name`). When `answers` is present — even as `[]` — a prompt
+with no matching answer fails *immediately* with the prompt text in
+`error`, and the result carries a `prompts` transcript of everything
+that was asked. So the discovery loop is: call once with
+`"answers": []`, read the transcript, retry with the answers filled in:
+
+```json
+{"form": "(kill-buffer \"scratch.txt\")", "answers": [true]}
+→ {"value": "t", "prompts": [{"type": "yes-or-no-p",
+   "prompt": "Buffer scratch.txt modified; kill anyway? ",
+   "answered": true, "answer": true}]}
+```
+
+The canned answers bypass the real input path (no completion,
+no `REQUIRE-MATCH`). To exercise the genuine input machinery instead,
+queue keys before the prompting call — `unread-command-events` feeds
+the real reader, and the *Messages* delta records the transcript:
+
+```elisp
+(let ((unread-command-events (listify-key-sequence "y")))
+  (kill-buffer "scratch.txt"))
+```
 
 ### Buffer / state
 
@@ -156,7 +204,7 @@ Every user-facing knob is a `defcustom` under the parent
 | Variable | Default | Purpose |
 |---|---|---|
 | `emacs-devtools-mcp-server-name` | `"default"` | Socket name segment under `${XDG_RUNTIME_DIR}/edmcp/`. |
-| `emacs-devtools-mcp-init-allowlist` | `~/.config/emacs`, `~/.emacs.d`, project root | Paths agents may pass to `bisect_init` / `init_lint` / `startup_profile` / `spawn_emacs`. |
+| `emacs-devtools-mcp-init-allowlist` | `~/.config/emacs`, `~/.emacs.d` | Paths agents may pass to `bisect_init` / `init_lint` / `startup_profile` / `spawn_emacs`. The current project root is allowed implicitly at check time (it is not part of the variable's value). |
 | `emacs-devtools-mcp-max-response-bytes` | `262144` | Global hard cap on per-call payload (text). |
 | `emacs-devtools-mcp-max-image-response-bytes` | `8388608` | Cap for responses that include an MCP `image` block. |
 | `emacs-devtools-mcp-screenshot-max-pixels` | `2560×1600` | Refuse oversize frames. |

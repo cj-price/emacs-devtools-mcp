@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.0
+;; Package-Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -11,7 +11,7 @@
 
 ;; Read-only buffer introspection plus `ert-run' and `describe-hooks'.
 ;; Tools route through `emacs-devtools-mcp-spawn-call' so the same
-;; code paths run on host and (eventually) subordinate Emacsen.
+;; code paths run on the host and on subordinate Emacsen.
 ;; Pagination uses the cursor store from
 ;; `emacs-devtools-mcp.el'; redaction is applied to any
 ;; *Messages*-derived surface.
@@ -39,7 +39,7 @@
   :group 'emacs-devtools-mcp-tools
   :package-version '(emacs-devtools-mcp . "0.1.0"))
 
-;;;; Pure runtime helpers (run on host today, subordinate later).
+;;;; Pure runtime helpers (run on the host or a subordinate via spawn-call).
 
 (defun emacs-devtools-mcp-tools-buffer--snapshot-list (filter)
   "Return a list of buffer plists, optionally narrowed by regex FILTER.
@@ -190,7 +190,9 @@ bypass the redaction layer the way `list-messages' is gated."
 Nil and the literal string \"t\" map to t (all loaded tests).  An
 empty string is treated as nil so missing-vs-empty is not a
 correctness pitfall.  Anything else is read with the Lisp reader
-after rejecting `#.'/`#@' reader-macro escapes -- so the full ERT
+after rejecting the unsafe reader syntax in
+`emacs-devtools-mcp-unsafe-reader-re' (`#.'/`#@' escapes and
+`#N='/`#N#' labels) -- so the full ERT
 selector grammar is available (`(tag :fast)', `(member t1 t2)',
 `(or A B)', `(satisfies PRED)', etc.) without exposing reader-time
 code execution.  A bare regexp must be wired through the reader as
@@ -203,9 +205,9 @@ literal that ERT then matches against test names."
     (cond
      ((string-empty-p selector) t)
      ((string= selector "t") t)
-     ((string-match-p "#[.@]" selector)
+     ((string-match-p emacs-devtools-mcp-unsafe-reader-re selector)
       (error
-       "Invalid ert selector: refuses `#.' / `#@' reader macros (got %S)"
+       "Invalid ert selector: refuses unsafe reader syntax #., #@, #N=/#N# (got %S)"
        selector))
      (t
       (condition-case err

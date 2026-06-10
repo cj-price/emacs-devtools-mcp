@@ -34,34 +34,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             xvfb socat jq
 
-      - name: Install Elisp dependencies
+      - name: Verify tag matches Package-Version (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          emacs --batch \
-            --eval "(progn \
-                      (require 'package) \
-                      (add-to-list 'package-archives \
-                                   '(\"gnu\" . \"https://elpa.gnu.org/packages/\")) \
-                      (add-to-list 'package-archives \
-                                   '(\"nongnu\" . \"https://elpa.nongnu.org/nongnu/\")) \
-                      (package-initialize) \
-                      (package-refresh-contents) \
-                      (dolist (p '(transient)) \
-                        (unless (package-installed-p p) \
-                          (package-install p))))"
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(sed -n 's/^;; Package-Version: //p' lisp/emacs-devtools-mcp.el)"
+          if [ "$tag" != "$ver" ]; then
+            echo "Tag v$tag does not match Package-Version $ver" >&2
+            exit 1
+          fi
 
       - name: make all
-        run: |
-          # GNU ELPA installs to ~/.config/emacs/elpa; expose those via EXTRA_LOAD.
-          ELPA_LOAD=$(emacs --batch --eval \
-            "(princ (mapconcat (lambda (d) (concat \"-L \" d)) \
-                                (directory-files package-user-dir t \"^[^.]\") \
-                                \" \"))")
-          make EXTRA_LOAD="$ELPA_LOAD" all
+        run: make all
 
       - name: make test-mcp
-        run: |
-          ELPA_LOAD=$(emacs --batch --eval \
-            "(princ (mapconcat (lambda (d) (concat \"-L \" d)) \
-                                (directory-files package-user-dir t \"^[^.]\") \
-                                \" \"))")
-          make EXTRA_LOAD="$ELPA_LOAD" test-mcp
+        run: make test-mcp

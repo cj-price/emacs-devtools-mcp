@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.0
+;; Package-Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -60,7 +60,7 @@
 ;; through the `read' that decodes the reply, nor smuggle a
 ;; shared/circular structure (via `#N=' reader labels) that would
 ;; amplify ~2^N when the value is JSON-serialized or its error is
-;; printed.  See `edmcp--spawn-unsafe-reader-re'.
+;; printed.  See `emacs-devtools-mcp-unsafe-reader-re'.
 
 ;;; Code:
 
@@ -184,7 +184,7 @@ cannot inject -- this check exists to keep server-file paths and
     (puthash handle rec emacs-devtools-mcp-spawn--handles)
     rec))
 
-(defun edmcp--spawn-record-public (rec)
+(defun emacs-devtools-mcp-spawn--record-public (rec)
   "Project REC into the wire shape used by tool handlers.
 Returns a plist with snake_case keys that round-trips through
 `json-serialize' without surprises.  The internal `:proc' field
@@ -580,7 +580,7 @@ was already dead'."
   "Return a list of public handle plists, sorted by handle string."
   (let (out)
     (maphash (lambda (_h rec)
-               (push (edmcp--spawn-record-public rec) out))
+               (push (emacs-devtools-mcp-spawn--record-public rec) out))
              emacs-devtools-mcp-spawn--handles)
     (sort out (lambda (a b) (string< (plist-get a :handle)
                                      (plist-get b :handle))))))
@@ -598,43 +598,15 @@ was already dead'."
 
 (add-hook 'kill-emacs-hook #'emacs-devtools-mcp-spawn-kill-all)
 
-(defconst edmcp--spawn-unsafe-reader-re "#\\(?:[.@]\\|[0-9]+[=#]\\)"
-  "Matches the unsafe reader syntax we refuse in raw daemon output.
-Three constructs are rejected:
-
-`#.' is the load-bearing case: it is read-time `eval', and Emacs
-`read' has no documented switch to inhibit it, so a reply
-carrying `#.' could execute code in the host.
-
-`#@COUNT' (skip COUNT characters) executes nothing, but is
-rejected too, for parity with the agent-input scanners in
-`emacs-devtools-mcp-tools-init' / `-tools-buffer' and as
-defense-in-depth against a reply desynchronizing the reader.
-
-`#N='/`#N#' reader labels are the only way `read' can build a
-shared or circular structure; without them the parsed value is a
-tree whose printed and JSON-serialized size is linear in the
-input.  A labeled DAG instead expands ~2^N, so a sub-kilobyte
-reply could blow up `json-serialize' (success path) or
-`error-message-string' (error path) and exhaust host memory.
-Rejecting the labels closes that amplifier at the source; the
-print caps in `edmcp--server-error-text' remain as a backstop.
-
-Byte-code literals (`#[') still pass -- they are never funcalled
-here and `json-serialize' refuses them outright, so they reach
-only the (now bounded) error path, not an amplifier.  The scan is
-position-blind: the rare reply whose printed value merely
-contains one of these sequences inside a string is rejected
-rather than parsed selectively.")
-
 (defun edmcp--spawn-parse-reply (raw)
   "Parse RAW emacsclient reply text into the corresponding Lisp value.
 Pre-scans for unsafe reader syntax (`#.', `#@', and `#N='/`#N#'
 reader labels) and refuses to call `read' on a reply that
-contains any of them -- see `edmcp--spawn-unsafe-reader-re'.
-Distinguishes truly empty input (\"empty reply\") from input that
-begins parsing but fails (\"unreadable\")."
-  (when (string-match-p edmcp--spawn-unsafe-reader-re raw)
+contains any of them -- see `emacs-devtools-mcp-unsafe-reader-re'
+for the construct-by-construct rationale.  Distinguishes truly
+empty input (\"empty reply\") from input that begins parsing but
+fails (\"unreadable\")."
+  (when (string-match-p emacs-devtools-mcp-unsafe-reader-re raw)
     (signal 'emacs-devtools-mcp-spawn-error
             (list "rejected unsafe reader syntax in daemon reply"
                   (string-trim raw))))

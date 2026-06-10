@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.0
+;; Package-Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -93,9 +93,9 @@ Returns a plist with:
   :error    the error-message string, or absent on success
 
 This function is the single source of truth for the `eval-elisp'
-tool's runtime behavior; it must remain self-contained so the
-same code path can be replayed inside a subordinate Emacs once
-spawn support lands."
+tool's runtime behavior; it must remain self-contained because
+`emacs-devtools-mcp-spawn-call' replays this exact code path
+inside a subordinate Emacs when the call targets a spawn."
   (let* ((messages-buf (get-buffer "*Messages*"))
          (start (and messages-buf
                      (with-current-buffer messages-buf (point-max))))
@@ -122,26 +122,137 @@ spawn support lands."
         (append base (list :value (or (emacs-devtools-mcp-redact result)
                                       "")))))))
 
+(defun emacs-devtools-mcp-tools-eval--run-with-answers (form pl plen answers)
+  "Evaluate FORM with PL/PLEN print caps and canned prompt ANSWERS.
+ANSWERS is a list consumed strictly in prompt order: t or
+`:json-false' answers the next `y-or-n-p' / `yes-or-no-p'; a
+string answers the next `read-string' / `read-from-minibuffer'
+\(which also catches `completing-read' and `read-file-name',
+since they read through it).  A prompt that finds no usable
+answer -- queue exhausted, or the next answer is the wrong kind
+-- signals immediately instead of blocking until the slow-tool
+timeout, so the caller gets the prompt text back in `:error' and
+can retry with a matching ANSWERS list.
+
+Returns the result plist of `emacs-devtools-mcp-tools-eval--run'
+plus `:prompts': a vector of transcript entries, one per prompt
+encountered, each carrying `:type', `:prompt' (redacted),
+`:answered', and -- when answered -- `:answer'.  The overrides
+replace the prompt functions wholesale, so INITIAL-INPUT /
+DEFAULT-VALUE / REQUIRE-MATCH semantics of the real readers do
+not apply; the canned answer is returned verbatim.  Like `--run',
+this stays self-contained so the spawn path can replay it inside
+a subordinate Emacs."
+  (let* ((remaining answers)
+         (transcript nil)
+         (record
+          (lambda (type prompt answered answer)
+            (push (append
+                   (list :type type
+                         :prompt (or (emacs-devtools-mcp-redact
+                                      (format "%s" prompt))
+                                     "")
+                         :answered (if answered t :json-false))
+                   (when answered (list :answer answer)))
+                  transcript)))
+         (next-bool
+          (lambda (type prompt)
+            (let ((a (car remaining)))
+              (if (memq a '(t :json-false))
+                  (progn
+                    (setq remaining (cdr remaining))
+                    (funcall record type prompt t a)
+                    (eq a t))
+                (funcall record type prompt nil nil)
+                (error "Unanswered %s prompt (no boolean next in answers): %s"
+                       type
+                       (or (emacs-devtools-mcp-redact (format "%s" prompt))
+                           ""))))))
+         (next-string
+          (lambda (type prompt)
+            (let ((a (car remaining)))
+              (if (stringp a)
+                  (progn
+                    (setq remaining (cdr remaining))
+                    (funcall record type prompt t a)
+                    a)
+                (funcall record type prompt nil nil)
+                (error "Unanswered %s prompt (no string next in answers): %s"
+                       type
+                       (or (emacs-devtools-mcp-redact (format "%s" prompt))
+                           "")))))))
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (prompt) (funcall next-bool "y-or-n-p" prompt)))
+              ((symbol-function 'yes-or-no-p)
+               (lambda (prompt) (funcall next-bool "yes-or-no-p" prompt)))
+              ((symbol-function 'read-string)
+               (lambda (prompt &rest _)
+                 (funcall next-string "read-string" prompt)))
+              ((symbol-function 'read-from-minibuffer)
+               (lambda (prompt &rest _)
+                 (funcall next-string "read-from-minibuffer" prompt))))
+      (let ((res (emacs-devtools-mcp-tools-eval--run form pl plen)))
+        (append res (list :prompts (vconcat (nreverse transcript))))))))
+
+(defun edmcp--eval-normalize-answers (answers)
+  "Validate wire ANSWERS (vector or list) and return it as a list.
+Each element must be t, `:json-false', or a string; anything else
+raises `-32602'.  Runs host-side before dispatch, like the `form'
+parse, so a bad answers element is invalid params -- never a tool
+execution failure."
+  (let ((lst (append answers nil))
+        (i 0))
+    (dolist (a lst)
+      (unless (or (eq a t) (eq a :json-false) (stringp a))
+        (jsonrpc-error
+         :code -32602
+         :message (format "answers[%d] must be a boolean or string, got %S"
+                          i a)))
+      (setq i (1+ i)))
+    lst))
+
+(defun edmcp--eval-read-form (form-str)
+  "Read one Lisp form from FORM-STR, raising `-32602' on parse failure.
+Shared by `eval-elisp' and `capture-backtrace'.  The parse runs
+host-side before dispatch, so a malformed string is invalid
+params (a JSON-RPC protocol error) -- unlike the predicate and
+selector parses in the init/ert tools, which run inside routed
+tool bodies and surface as `isError' envelopes.
+
+Because the read happens on the host, reader syntax in FORM-STR
+\(including `#.' read-time eval) executes host-side even when the
+call targets a spawn.  That is within the threat model -- the
+eval tools are unsandboxed by design and the agent could target
+the host directly -- but spawn targeting is routing, not
+isolation."
+  (condition-case err
+      (with-temp-buffer
+        (insert form-str)
+        (goto-char (point-min))
+        (read (current-buffer)))
+    (error
+     (jsonrpc-error
+      :code -32602
+      :message (format "form parse error: %s"
+                       (error-message-string err))))))
+
 (defun edmcp--tools-eval-elisp (params)
   "Handler for `eval-elisp'.  PARAMS is the validated request plist."
   (let* ((form-str (plist-get params :form))
          (pl (or (plist-get params :print_level) 6))
          (plen (or (plist-get params :print_length) 100))
          (target (plist-get params :target))
-         (form
-          (condition-case err
-              (with-temp-buffer
-                (insert form-str)
-                (goto-char (point-min))
-                (read (current-buffer)))
-            (error
-             (jsonrpc-error
-              :code -32602
-              :message (format "form parse error: %s"
-                               (error-message-string err)))))))
-    (emacs-devtools-mcp-spawn-call
-     target
-     `(emacs-devtools-mcp-tools-eval--run ',form ,pl ,plen))))
+         (answers-raw (plist-get params :answers))
+         (form (edmcp--eval-read-form form-str)))
+    (if answers-raw
+        (emacs-devtools-mcp-spawn-call
+         target
+         `(emacs-devtools-mcp-tools-eval--run-with-answers
+           ',form ,pl ,plen
+           ',(edmcp--eval-normalize-answers answers-raw)))
+      (emacs-devtools-mcp-spawn-call
+       target
+       `(emacs-devtools-mcp-tools-eval--run ',form ,pl ,plen)))))
 
 ;;;; edebug-instrument / edebug-uninstrument.
 
@@ -443,17 +554,7 @@ buffer doesn't exist or violates the name pattern."
          (pl (or (plist-get params :print_level) 6))
          (plen (or (plist-get params :print_length) 100))
          (target (plist-get params :target))
-         (form
-          (condition-case err
-              (with-temp-buffer
-                (insert form-str)
-                (goto-char (point-min))
-                (read (current-buffer)))
-            (error
-             (jsonrpc-error
-              :code -32602
-              :message (format "form parse error: %s"
-                               (error-message-string err)))))))
+         (form (edmcp--eval-read-form form-str)))
     (emacs-devtools-mcp-spawn-call
      target
      `(emacs-devtools-mcp-tools-eval--capture-backtrace
@@ -514,7 +615,20 @@ lines whose first non-whitespace token starts with `auth-source-',
 `epg-', or `tramp-' (modulo a leading open paren) are dropped
 before transit.  A line that only mentions one of those tokens
 mid-content -- e.g.\\ `(message \"auth-source: x\")' -- is not
-redacted; see `emacs-devtools-mcp-redact' for the exact patterns."
+redacted; see `emacs-devtools-mcp-redact' for the exact patterns.
+
+Optional ANSWERS pre-answers interactive prompts: an array
+consumed in prompt order, where a boolean answers the next
+`y-or-n-p'/`yes-or-no-p' and a string answers the next
+`read-string'/`read-from-minibuffer' (which also covers
+`completing-read' and `read-file-name').  When ANSWERS is present
+-- even as `[]' -- a prompt with no matching answer fails
+immediately with the prompt text in `error' instead of blocking
+until the slow-tool timeout, and the result gains `prompts': a
+transcript of every prompt asked and the answer it consumed.  To
+discover what a form will ask, call once with `\"answers\": []'
+and read the transcript, then retry with the answers filled in.
+Without ANSWERS, prompts read real input and the timeout applies."
   :cost :slow
   :read-only nil
   :destructive t
@@ -523,6 +637,8 @@ redacted; see `emacs-devtools-mcp-redact' for the exact patterns."
             :properties ((form          . (:type "string"))
                          (print_level   . (:type ["integer" "null"]))
                          (print_length  . (:type ["integer" "null"]))
+                         (answers       . (:type ["array" "null"]
+                                           :items (:type ["boolean" "string"])))
                          (target        . ,emacs-devtools-mcp-target-schema))
             :required ["form"])
   :handler #'edmcp--tools-eval-elisp)

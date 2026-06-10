@@ -147,6 +147,13 @@ fi
 echo "PASS initialize           protocolVersion=$init_proto"
 PASS=$((PASS + 1))
 
+# A spec-conforming client sends notifications/initialized right after
+# the handshake.  The server must ignore it without a reply and keep
+# serving -- if this regressed into closing or replying, the very next
+# read (tools/list below) would fail or desynchronize.
+jq -nc '{jsonrpc:"2.0", method:"notifications/initialized"}' >&3
+echo "SENT notifications/initialized (no reply expected)"
+
 # tools/list smoke -- count must equal the registry size, derived
 # from the deftool call sites in lisp/ so adding or removing a tool
 # cannot silently drift past a hard-coded threshold.
@@ -178,6 +185,9 @@ call ping                  '{"message":"hi"}'
 # location and edebug refuses to instrument it.
 call eval_elisp            "$(jq -nc --arg f "$FIXTURE" '{form:("(load \"" + $f + "\" nil t)")}')"
 call eval_elisp            '{"form":"(edmcp-e2e-fixture 21)"}'
+# Canned-answer path: a prompting form must resolve from `answers`
+# rather than blocking until the slow-tool timeout.
+call eval_elisp            '{"form":"(if (y-or-n-p \"e2e? \") :yes :no)","answers":[true]}'
 call edebug_instrument     '{"function":"edmcp-e2e-fixture"}'
 call edebug_uninstrument   '{"function":"edmcp-e2e-fixture"}'
 call capture_backtrace     '{"form":"(error \"e2e probe\")"}'
@@ -187,7 +197,9 @@ call trace_log             '{}'
 call untrace_function      '{"function":"edmcp-e2e-fixture"}'
 
 # --- buffer / state ---
-call list_buffers          '{}'
+# Explicit host target on one call so the canonical `{"host": true}`
+# shape is exercised over the wire, not just the omitted default.
+call list_buffers          '{"target":{"host":true}}'
 call buffer_state          '{"buffer":"*scratch*"}'
 call buffer_substring      '{"buffer":"*scratch*","start":1,"end":1}'
 call list_messages         '{}'
@@ -318,6 +330,20 @@ if [ "$unk_code" = "-32601" ]; then
   PASS=$((PASS + 1))
 else
   printf 'FAIL %-22s body=%s\n' '(unknown tool)' "$unk_line"
+  FAIL=$((FAIL + 1))
+fi
+
+# Unknown *method* (not just unknown tool) must also be -32601.
+ID=$((ID + 1))
+jq -nc --argjson id "$ID" \
+  '{jsonrpc:"2.0", id:$id, method:"resources/list", params:{}}' >&3
+IFS= read -r -t 10 -u 4 meth_line
+meth_code="$(jq -r '.error.code // empty' <<<"$meth_line")"
+if [ "$meth_code" = "-32601" ]; then
+  printf 'PASS %-22s code=-32601\n' '(unknown method)'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL %-22s body=%s\n' '(unknown method)' "$meth_line"
   FAIL=$((FAIL + 1))
 fi
 

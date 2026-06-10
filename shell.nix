@@ -1,16 +1,10 @@
 { pkgs ? import <nixpkgs> {} }:
 
-let
-  emacsWithDeps = pkgs.emacs30.pkgs.withPackages (epkgs: with epkgs; [
-    transient
-  ]);
-in
-
 pkgs.mkShell {
   buildInputs = with pkgs; [
-    emacsWithDeps
+    emacs30
     xvfb-run
-    xorg.xorgserver
+    xorg-server
     socat
     gnumake
     jq

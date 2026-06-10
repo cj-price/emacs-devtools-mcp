@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.0
+;; Package-Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -11,7 +11,7 @@
 
 ;; Listens on a Unix-domain socket at
 ;; `${XDG_RUNTIME_DIR}/edmcp/${NAME}.sock'.  Each accepted connection
-;; is wrapped in an `emacs-devtools-mcp-rpc-connection' (story 003).
+;; is wrapped in an `emacs-devtools-mcp-rpc-connection'.
 ;; Hard-fails if `XDG_RUNTIME_DIR' is unset; never falls back to
 ;; `/tmp'.  Refuses to bind on top of a non-socket file, a symlink, or
 ;; a path owned by another uid.  Unlinks a stale socket (S_ISSOCK +
@@ -47,13 +47,20 @@ collision."
   "List of live client RPC connections.")
 
 (defconst emacs-devtools-mcp-server--protocol-version "2024-11-05"
-  "MCP protocol version we advertise in the `initialize' result.")
+  "MCP protocol version we advertise in the `initialize' result.
+Deliberately the 2024-11-05 revision even though `tools/list'
+emits `annotations' (`readOnlyHint' etc.), which the spec added in
+2025-03-26: every feature this server actually requires is in the
+older revision, clients must ignore unknown fields, and advertising
+the older version keeps strict 2024-11-05 clients connectable.")
 
 (defun edmcp--server-runtime-dir ()
   "Return `XDG_RUNTIME_DIR', or signal `user-error' if unset."
   (or (getenv "XDG_RUNTIME_DIR")
       (user-error
-       "XDG_RUNTIME_DIR is unset; refusing to fall back to /tmp")))
+       (concat "XDG_RUNTIME_DIR is unset; refusing to fall back to /tmp.  "
+               "On systems without it (macOS, most BSDs), export it to a "
+               "private mode-0700 directory you own before starting Emacs"))))
 
 (defun edmcp--server-socket-dir ()
   "Return the per-user MCP socket directory path (with trailing slash)."
@@ -66,10 +73,24 @@ collision."
                     (edmcp--server-socket-dir)))
 
 (defun edmcp--server-ensure-dir ()
-  "Create the socket directory if absent and enforce mode 0700."
-  (let ((dir (edmcp--server-socket-dir)))
+  "Create the socket directory if absent and enforce mode 0700.
+Mirrors the hostile-state checks `edmcp--server-validate-or-unlink'
+applies to the socket itself: refuse a symlink (so the 0700 chmod
+cannot be redirected to another path) and refuse a directory owned
+by a different uid.  `$XDG_RUNTIME_DIR' being per-user 0700 makes
+both conditions same-uid-only in practice; the checks are symmetry
+with the socket path, not a new trust boundary."
+  (let* ((dir (edmcp--server-socket-dir))
+         (bare (directory-file-name dir)))
+    (when (file-symlink-p bare)
+      (user-error "Refusing to use %s: it is a symlink" dir))
     (unless (file-directory-p dir)
       (make-directory dir t))
+    (let* ((attrs (file-attributes bare 'integer))
+           (uid (and attrs (file-attribute-user-id attrs))))
+      (unless (and uid (= uid (user-uid)))
+        (user-error "Refusing to use %s: owned by uid %s, not %d"
+                    dir uid (user-uid))))
     (set-file-modes dir #o700)
     dir))
 
@@ -308,7 +329,7 @@ METHOD is a symbol; PARAMS a plist.  Until the connection is
 authenticated, only `initialize' with a matching `_meta.token' is
 accepted; everything else gets a JSON-RPC error and the
 connection is closed."
-  (let ((proc (edmcp--rpc-process conn)))
+  (let ((proc (emacs-devtools-mcp-rpc--process conn)))
     (cond
      ((process-get proc 'edmcp-authenticated)
       (emacs-devtools-mcp-server-default-dispatcher conn method params))
@@ -342,7 +363,7 @@ METHOD is a symbol; _PARAMS is unused (no notifications are
 acted upon today).  Drops anything received before authentication
 and closes the connection (per AC: any non-initialize first frame
 is rejected).  After auth, notifications are silently ignored."
-  (let ((proc (edmcp--rpc-process conn)))
+  (let ((proc (emacs-devtools-mcp-rpc--process conn)))
     (unless (process-get proc 'edmcp-authenticated)
       (emacs-devtools-mcp-auth-log-failure
        (jsonrpc-name conn)

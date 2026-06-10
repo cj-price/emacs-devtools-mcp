@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.0
+;; Package-Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -17,7 +17,7 @@
 ;;   `key-translation-trace' -- step through translation maps.
 ;;
 ;; Tools route through `emacs-devtools-mcp-spawn-call' so the same
-;; code path runs on host and (eventually) subordinate Emacsen.
+;; code path runs on the host and on subordinate Emacsen.
 
 ;;; Code:
 
@@ -41,7 +41,7 @@
   :group 'emacs-devtools-mcp-tools
   :package-version '(emacs-devtools-mcp . "0.1.0"))
 
-;;;; Pure runtime helpers (run on host today, subordinate later).
+;;;; Pure runtime helpers (run on the host or a subordinate via spawn-call).
 
 (defun emacs-devtools-mcp-tools-keys--resolve-keymap (name)
   "Resolve NAME to a keymap value.

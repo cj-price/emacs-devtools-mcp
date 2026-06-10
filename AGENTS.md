@@ -98,8 +98,9 @@ Text/binary tools (`buffer-substring`, `screenshot-frame`) take a `max_bytes` an
 
 ## Error envelope
 
-- **Protocol failures** (unknown tool, schema-invalid args): JSON-RPC `error` object with codes `-32601` (method not found), `-32602` (invalid params).
-- **Tool execution failures** (eval signal, buffer not found, payload too large): success response with `isError: true` + MCP content blocks. **Never** invent custom codes in the JSON-RPC `-32600..-32603` range.
+- **Protocol failures**: JSON-RPC `error` object with codes `-32601` (unknown tool or method), `-32602` (schema-invalid args; also a malformed `form` string in `eval_elisp`/`capture_backtrace`, whose parse runs host-side *before* dispatch), `-32000` (slow-tool timeout/interruption).
+- **Tool execution failures** (handler signal, buffer not found, payload too large; also parse failures of strings consumed *inside* a routed tool body, like `ert_run`'s selector and `bisect_init`'s predicate): success response with `isError: true` + MCP content blocks. **Never** invent custom codes in the JSON-RPC `-32600..-32603` range.
+- Errors signaled by the *evaluated form* in `eval_elisp`/`capture_backtrace` are not failures of the tool: they come back as data (`:error` key in the JSON body, `isError: false`). The tool ran; the form's failure is its result.
 - `print-level` and `print-length` capped server-side so error data can't explode.
 - Output redaction: regex strip lines matching `auth-source-`/`epg-`/`tramp-` (configurable) before sending any *Messages*/backtrace surface.
 
@@ -114,7 +115,7 @@ Text/binary tools (`buffer-substring`, `screenshot-frame`) take a `max_bytes` an
 
 ## Screenshots
 
-Host Emacs build is probed lazily on the first `screenshot-frame` call. A trial `x-export-frames nil 'png` either returns valid PNG bytes (sets `emacs-devtools-mcp-tools-gui--host-backend` to `'x-export-frames` and uses it from then on) or sets the backend to `'unavailable` and the tool returns a structured error. Frames whose pixel area exceeds `emacs-devtools-mcp-screenshot-max-pixels` are refused before encoding.
+Host Emacs build is probed lazily on the first `screenshot-frame` call. The probe looks for *any* graphical frame (selected first, then `frame-list` — the `emacs --daemon` + GUI-client topology can dispatch with the dumb terminal frame selected) and runs a trial `x-export-frames nil 'png` on it. Valid PNG bytes cache `'x-export-frames` in `emacs-devtools-mcp-tools-gui--host-backend` for the lifetime of the host; a failed probe returns a structured error but is **not** cached, so a GUI frame opened later is picked up on the next call. Frames whose pixel area exceeds `emacs-devtools-mcp-screenshot-max-pixels` are refused before encoding.
 
 `screenshot-frame` returns the standard MCP `image` content block (`{type: "image", data, mimeType}`) — no custom envelope, no width/height sidecar.
 
@@ -126,7 +127,7 @@ See the Makefile header for target definitions. CI: Emacs 30.1. `make all` + `ma
 
 - **One** behavior-organized file: `test/emacs-devtools-mcp-tests.el` with `;;; ___Section___` banners (Server, RPC, Spawn, GUI, Keys, Eval, Init, Buffer). End-to-end MCP-protocol coverage lives in `test/e2e-smoke.sh`, run via `make test-mcp`.
 - ERT tag selectors mandatory: `:fast`, `:daemon`, `:fresh-daemon`, `:gui`. `make test-{fast,daemon,gui}` filter on these. Pure-logic tests must be `:fast`.
-- Property tests for pure functions (color-contrast math, RPC encode/decode round-trip, schema validator, redaction) use seeded `cl-random` generators. `propcheck` is not in the dep set yet; the existing tests are framed as "stand-in for a propcheck generative test" so they swap cleanly when propcheck lands.
+- Property-style testing: the RPC encode/decode round-trip has a seeded `cl-random` generative test (random frame chunking); color-contrast math, the schema validator, and redaction are covered example-based. `propcheck` is not in the dep set yet; the seeded test is framed as "stand-in for a propcheck generative test" so it swaps cleanly when propcheck lands, and the example-based areas are the natural candidates to generalize then.
 - **"No mocks" — narrow form**: don't mock the system under test (Emacs, emacsclient, sockets, file system). Auxiliary stubbing with `cl-letf` (e.g., faking `read-passwd`, `current-time`, `random`) is fine — magit does this. Real git, real Emacs.
 - **Daemon fixture**: shared subordinate Emacs cached in a `defvar` across `:daemon` tests; per-test isolation via `emacsclient --eval`-driven reset; `:fresh-daemon` tests opt out for clean `-Q` spawns.
 
@@ -143,7 +144,7 @@ What's defended:
 - Peer: per-launch token in first frame; access boundary is the 0700 dir + 0600 socket/token files (no `SO_PEERCRED` from Lisp).
 - Stale socket: verified `S_ISSOCK` + same-uid + non-symlink before bind.
 - Subprocess: `make-process` argv lists everywhere; `[A-Za-z0-9_-]+` validation on `server_name`.
-- Reader injection: subordinate `emacsclient --eval` output is pre-scanned for `#.` / `#@` reader macros and rejected before `read` runs (Emacs has no documented switch to inhibit `#.` evaluation in `read`).
+- Reader injection: every `read` of untrusted text (subordinate `emacsclient --eval` replies, `bisect_init` predicate and init-file scan, `startup_profile` probe output, `ert_run` selector) is pre-scanned against the shared `emacs-devtools-mcp-unsafe-reader-re` and rejected on `#.` (read-time eval — Emacs has no documented switch to inhibit it), `#@` (reader skip), or `#N=`/`#N#` labels (shared-structure ~2^N print amplifier). One constant, so the rejected set cannot drift between read sites. The agent-supplied `form` in the eval tools is deliberately *not* scanned (unsandboxed by design), but note it is `read` host-side even when targeting a spawn — spawn targeting is routing, not isolation.
 - Init paths: allowlist-checked.
 - Output: redaction layer strips `auth-source-`/`epg-`/`tramp-` lines from *Messages*/backtraces.
 - Resource caps: `with-timeout` on every `:slow` handler; `max-response-bytes`; `screenshot-max-pixels`; `unwind-protect` around `profiler-start`.

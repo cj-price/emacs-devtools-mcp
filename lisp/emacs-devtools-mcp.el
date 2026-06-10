@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.0
+;; Package-Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -29,8 +29,11 @@
 (require 'cl-lib)
 (require 'jsonrpc)
 
-(defconst emacs-devtools-mcp-version "0.1.1"
-  "Current version of the `emacs-devtools-mcp' package.")
+(defconst emacs-devtools-mcp-version "0.1.4"
+  "Current version of the `emacs-devtools-mcp' package.
+Must match the `Package-Version' header of this file; a `:fast'
+ERT test enforces the pairing so the release tag, the header, and
+the `serverInfo' version advertised in `initialize' cannot drift.")
 
 (defgroup emacs-devtools-mcp nil
   "Devtools MCP server for Emacs."
@@ -127,6 +130,41 @@ syntax, e.g. `(target . ,emacs-devtools-mcp-target-schema), so
 every tool advertises the same canonical host/spawn `:oneOf'
 shape.  The validator handles vector arrays uniformly via
 `edmcp--as-list'.")
+
+(defconst emacs-devtools-mcp-unsafe-reader-re "#\\(?:[.@]\\|[0-9]+[=#]\\)"
+  "Matches the reader syntax refused before any `read' of untrusted text.
+Shared by every scanner that guards a `read' call: the spawn-reply
+parser in `emacs-devtools-mcp-spawn', the agent-supplied predicate
+and probe-output scans in `emacs-devtools-mcp-tools-init', and the
+ert selector scan in `emacs-devtools-mcp-tools-buffer'.  One
+constant, so the rejected set cannot drift between read sites.
+
+Three constructs are rejected:
+
+`#.' is the load-bearing case: it is read-time `eval', and Emacs
+`read' has no documented switch to inhibit it, so scanned text
+carrying `#.' could execute code in the host.
+
+`#@COUNT' (skip COUNT characters) executes nothing, but is
+rejected as defense-in-depth against input desynchronizing the
+reader.
+
+`#N='/`#N#' reader labels are the only way `read' can build a
+shared or circular structure; without them the parsed value is a
+tree whose printed and JSON-serialized size is linear in the
+input.  A labeled DAG instead expands ~2^N, so a sub-kilobyte
+input could blow up `json-serialize' (success path) or
+`error-message-string' (error path) and exhaust host memory.
+Rejecting the labels closes that amplifier at the source; the
+bounded error printing in `emacs-devtools-mcp-server' remains as
+a backstop.
+
+Byte-code literals (`#[') still pass -- they are never funcalled
+by any consumer and `json-serialize' refuses them outright, so
+they reach only the (bounded) error path, not an amplifier.  The
+scan is position-blind: the rare input whose printed value merely
+contains one of these sequences inside a string is rejected
+rather than parsed selectively.")
 
 (defun emacs-devtools-mcp-random-hex (n-bytes)
   "Return a hex string of N-BYTES bytes drawn from `/dev/urandom'.
@@ -308,16 +346,21 @@ to underscores."
                `(lambda (params)
                   (let ((,slow-wrap-sym
                          (while-no-input
-                           (with-timeout
-                               (emacs-devtools-mcp-slow-tool-timeout
-                                (jsonrpc-error
-                                 :code -32000
-                                 :message "Tool execution timed out"))
-                             (funcall ,handler params)))))
-                    (when (eq ,slow-wrap-sym t)
-                      (jsonrpc-error :code -32000
-                                     :message "Tool execution interrupted"))
-                    ,slow-wrap-sym))
+                           ;; Cons-wrap the handler's value: a handler
+                           ;; legitimately returning t would otherwise be
+                           ;; indistinguishable from `while-no-input's
+                           ;; input-arrived sentinel (literal t).
+                           (cons 'value
+                                 (with-timeout
+                                     (emacs-devtools-mcp-slow-tool-timeout
+                                      (jsonrpc-error
+                                       :code -32000
+                                       :message "Tool execution timed out"))
+                                   (funcall ,handler params))))))
+                    (if (eq ,slow-wrap-sym t)
+                        (jsonrpc-error :code -32000
+                                       :message "Tool execution interrupted")
+                      (cdr ,slow-wrap-sym))))
              handler)))
       `(progn
          (emacs-devtools-mcp--register-tool

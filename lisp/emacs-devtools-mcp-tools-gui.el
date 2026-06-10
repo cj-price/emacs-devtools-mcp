@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.0
+;; Package-Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -19,11 +19,11 @@
 ;;   `screenshot-frame'  -- PNG export of a frame as an MCP image block.
 ;;
 ;; The screenshot path runs `x-export-frames' on the host; the
-;; backend probe is lazy and cached.  In batch mode (no display) the
-;; tool returns a structured error rather than crashing.  The plan
-;; calls for grim/xwd fallbacks on pgtk/Wayland; those slots exist
-;; here as commentary and will be filled in alongside the spawn
-;; daemon (where xvfb-run guarantees X11) in story 015.
+;; backend probe is lazy and caches success.  In batch mode (no
+;; display) the tool returns a structured error rather than crashing.
+;; `x-export-frames' is the only backend; a daemon that needs a
+;; screenshot-capable display can use `spawn_emacs' with
+;; `display_mode: "xvfb-run"'.
 
 ;;; Code:
 
@@ -57,10 +57,9 @@ frame (e.g. 1692x1350 = 2.28 MP, 2880x1800 = 5.18 MP triggers
 the cap deliberately).  Lower this for bandwidth-sensitive
 agents; raise it for very large displays.
 
-Phase 5 honors the cap by refusing to export frames whose pixel
-dimensions exceed this product; downscaling is deferred until the
-spawn-side daemon exists (so a single ImageMagick invocation can
-do it once for both targets)."
+The cap is enforced by refusing to export frames whose pixel
+dimensions exceed this product; there is no downscaling -- a
+too-large frame returns a structured error naming the cap."
   :type '(cons natnum natnum)
   :group 'emacs-devtools-mcp-tools
   :package-version '(emacs-devtools-mcp . "0.1.0"))
@@ -68,16 +67,16 @@ do it once for both targets)."
 (defvar emacs-devtools-mcp-tools-gui--host-backend nil
   "Cached symbol describing how host screenshots are produced.
 Possible values:
-  nil               -- not yet probed,
-  `x-export-frames' -- the built-in works on this Emacs build,
-  `unavailable'     -- no working backend (batch mode, no DISPLAY).
-The probe runs the first time `screenshot-frame' is called and
-sticks for the lifetime of the host Emacs.  A user running
-`emacs --daemon' who only opens their first GUI frame after
-starting the server should `M-x set-variable' this back to nil
-to force a re-probe -- or restart the server.")
+  nil               -- not yet probed, or no working backend found
+                       on the most recent probe,
+  `x-export-frames' -- the built-in works on this Emacs build.
+Only success is cached: a probe that finds no graphical frame
+\(batch mode, daemon before its first GUI client frame) reports
+`unavailable' for that call but leaves this nil, so the next
+`screenshot-frame' re-probes.  A daemon user who opens a GUI
+frame after a failed screenshot can simply retry.")
 
-;;;; Pure runtime helpers (run on host today, subordinate later).
+;;;; Pure runtime helpers (run on the host or a subordinate via spawn-call).
 
 (defun emacs-devtools-mcp-tools-gui--bool (x)
   "Return t when X is non-nil, otherwise `:json-false'.
@@ -339,33 +338,51 @@ face list."
           (vconcat (mapcar #'emacs-devtools-mcp-tools-gui--frame-snapshot
                            frames)))))
 
+(defun emacs-devtools-mcp-tools-gui--graphic-frame ()
+  "Return a graphical frame, preferring the selected one, or nil.
+A daemon Emacs dispatching over the server socket may have its
+dumb terminal frame selected even while a GUI client frame
+exists; scanning `frame-list' finds that frame instead of
+declaring screenshots unavailable."
+  (if (display-graphic-p)
+      (selected-frame)
+    (cl-find-if #'display-graphic-p (frame-list))))
+
 (defun emacs-devtools-mcp-tools-gui--probe-host-backend ()
-  "Probe and cache the host screenshot backend.
-Sets `emacs-devtools-mcp-tools-gui--host-backend' to either
-`x-export-frames' (built-in works) or `unavailable' (no display
-available -- batch mode, missing DISPLAY/WAYLAND_DISPLAY).  The
-plan reserves slots for `grim' and `xwd' fallbacks; those will be
-added alongside the spawn daemon."
+  "Probe the host screenshot backend; cache only success.
+Returns `x-export-frames' when a trial PNG export succeeds on
+some graphical frame (also caching that in
+`emacs-devtools-mcp-tools-gui--host-backend'), else returns
+`unavailable' *without* caching -- batch mode or a daemon that
+has not opened a GUI frame yet should be re-probed on the next
+call, since a GUI client frame can appear at any time."
   (or emacs-devtools-mcp-tools-gui--host-backend
-      (setq emacs-devtools-mcp-tools-gui--host-backend
-            (cond
-             ((not (display-graphic-p)) 'unavailable)
-             ((condition-case _
-                  ;; `x-export-frames' defaults to PDF; we want PNG
-                  ;; bytes here so the magic-byte check matches what
-                  ;; `--screenshot' will later produce.
-                  (let ((bytes (x-export-frames nil 'png)))
-                    (and (stringp bytes)
-                         (>= (length bytes) 8)
-                         (string-prefix-p "\x89PNG" bytes)))
-                (error nil))
-              'x-export-frames)
-             (t 'unavailable)))))
+      (let* ((frame (emacs-devtools-mcp-tools-gui--graphic-frame))
+             (works
+              (and frame
+                   (condition-case _
+                       ;; `x-export-frames' defaults to PDF; we want PNG
+                       ;; bytes here so the magic-byte check matches what
+                       ;; `--screenshot' will later produce.
+                       (let ((bytes (with-selected-frame frame
+                                      (x-export-frames nil 'png))))
+                         (and (stringp bytes)
+                              (>= (length bytes) 8)
+                              (string-prefix-p "\x89PNG" bytes)))
+                     (error nil)))))
+        (if works
+            (setq emacs-devtools-mcp-tools-gui--host-backend 'x-export-frames)
+          'unavailable))))
 
 (defun emacs-devtools-mcp-tools-gui--resolve-frame (name)
-  "Resolve frame NAME to a frame object, or signal on miss."
+  "Resolve frame NAME to a frame object, or signal on miss.
+A nil NAME prefers the selected frame when it is graphical, else
+the first graphical frame (the daemon topology), else falls back
+to the selected frame so the backend check produces the
+unavailability error."
   (cond
-   ((null name) (selected-frame))
+   ((null name) (or (emacs-devtools-mcp-tools-gui--graphic-frame)
+                    (selected-frame)))
    ((not (stringp name))
     (error "Frame name must be a string, got %S" name))
    (t
@@ -539,7 +556,7 @@ so the response is exactly the standard MCP `image' block."
 Returns a structured error when no display backend is available
 (batch mode, no DISPLAY).  The frame's pixel dimensions must fit
 within `emacs-devtools-mcp-screenshot-max-pixels'."
-  :cost :fast
+  :cost :slow
   :read-only t
   :idempotent t
   :schema `(:type "object"

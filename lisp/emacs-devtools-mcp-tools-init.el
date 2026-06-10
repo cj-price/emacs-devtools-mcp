@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.0
+;; Package-Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -77,23 +77,29 @@ fails the allowlist check."
     (emacs-devtools-mcp-auth-validate-init-path target)))
 
 (defun edmcp--tools-init-reject-read-eval (label text)
-  "Signal when LABEL's TEXT carries a `#.' or `#@' reader macro.
-The `#.' construct evaluates at read time -- accepting it from
-agent input or subordinate output would punch through every
-other isolation gate in this file.  `#@' (compiled docstring
-references) is never legitimately printed by our subordinate."
+  "Signal when LABEL's TEXT carries unsafe reader syntax.
+Rejects `#.' (read-time eval -- accepting it from agent input or
+subordinate output would punch through every other isolation gate
+in this file), `#@' (reader skip), and `#N='/`#N#' reader labels
+\(the shared-structure print amplifier).  The pattern is the
+package-wide `emacs-devtools-mcp-unsafe-reader-re', shared with
+the spawn-reply scanner so the rejected set cannot drift between
+read sites."
   (when (and (stringp text)
-             (string-match-p "#[.@]" text))
+             (string-match-p emacs-devtools-mcp-unsafe-reader-re text))
     (signal 'emacs-devtools-mcp-init-error
-            (list (format "%s contains a reader macro (#./#@); refusing"
+            (list (format "%s contains unsafe reader syntax (#., #@, or #N=/#N# labels); refusing"
                           label)))))
 
 (defun edmcp--tools-init-read-trusted-string (label text)
   "Read one Lisp form from LABEL's TEXT after rejecting reader macros.
-Parse errors and `#.'/`#@' presence both raise
+Parse errors and unsafe-reader-syntax presence both raise
 `emacs-devtools-mcp-init-error' so the dispatch layer wraps
 them in an `isError' envelope rather than a JSON-RPC protocol
-error code."
+error code.  (`-32602' is reserved for host-side parses that run
+before dispatch, like `eval-elisp''s `form'; this helper also
+parses subordinate probe output, where a parse failure is a tool
+execution failure, not bad client params.)"
   (edmcp--tools-init-reject-read-eval label text)
   (condition-case err
       (with-temp-buffer
@@ -348,8 +354,8 @@ prints the sentinel cannot poison the parser."
 Each plist has `:line-start', `:line-end' (1-based inclusive),
 and `:end-pos' (the buffer character position immediately after
 the form, used to slice prefixes verbatim).  Refuses files
-containing `#.' or `#@' reader macros so reading cannot evaluate
-agent-influenced content host-side."
+containing unsafe reader syntax (`#.', `#@', `#N='/`#N#') so
+reading cannot evaluate agent-influenced content host-side."
   (with-temp-buffer
     (insert-file-contents file-real)
     (edmcp--tools-init-reject-read-eval

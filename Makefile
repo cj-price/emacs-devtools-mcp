@@ -87,7 +87,7 @@ clean:
 install:
 	@if [ -z "$$HOME" ]; then echo "HOME unset" >&2; exit 1; fi
 	@if [ ! -x $(CURDIR)/bin/emacs-devtools-mcp ]; then \
-	  echo "$(CURDIR)/bin/emacs-devtools-mcp does not exist or is not executable; build it first (story 007)" >&2; \
+	  echo "$(CURDIR)/bin/emacs-devtools-mcp does not exist or is not executable" >&2; \
 	  exit 1; \
 	fi
 	@mkdir -p $$HOME/.local/bin

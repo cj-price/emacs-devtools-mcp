@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.0
+;; Package-Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -46,13 +46,13 @@ remain."
          (rec (apply #'emacs-devtools-mcp-spawn-spawn
                      (append (when init (list :init init))
                              (when mode (list :display-mode mode))))))
-    (edmcp--spawn-record-public rec)))
+    (emacs-devtools-mcp-spawn--record-public rec)))
 
 (defun edmcp--tools-spawn-attach (params)
   "Handler for `attach-emacs'.  PARAMS is the validated request plist."
   (let* ((sn (plist-get params :server_name))
          (rec (emacs-devtools-mcp-spawn-attach sn)))
-    (edmcp--spawn-record-public rec)))
+    (emacs-devtools-mcp-spawn--record-public rec)))
 
 (defun edmcp--tools-spawn-kill (params)
   "Handler for `kill-spawn'.  PARAMS is the validated request plist.
@@ -139,7 +139,7 @@ which the reaper would later kill."
     "Register an externally-started Emacs daemon by SERVER_NAME.
 Probes the daemon before recording the handle; signals when no
 daemon answers at the given name."
-  :cost :fast
+  :cost :slow
   :read-only nil
   :destructive t
   :idempotent nil
@@ -154,7 +154,7 @@ Named `kill-spawn' rather than `kill-emacs' so a misread on the
 wire (e.g.\\ in an agent's tool log) cannot be mistaken for a
 request to terminate the host Emacs.  Only registered subordinate
 handles are addressable here."
-  :cost :fast
+  :cost :slow
   :read-only nil
   :destructive t
   :idempotent t

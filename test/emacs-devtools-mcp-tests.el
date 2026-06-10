@@ -35,6 +35,22 @@
   (should (stringp emacs-devtools-mcp-version))
   (should (> (length emacs-devtools-mcp-version) 0)))
 
+(ert-deftest emacs-devtools-mcp-tests/version-header-matches-defconst ()
+  "`Package-Version' header equals `emacs-devtools-mcp-version'.
+The header is what a release tag and package archives see; the
+defconst is what `initialize' advertises in `serverInfo'.  They
+drifted once (header 0.1.0 vs defconst 0.1.1 under a v0.1.3 tag);
+this pins them together."
+  :tags '(:fast)
+  (let* ((file (locate-library "emacs-devtools-mcp.el" t))
+         (header
+          (with-temp-buffer
+            (insert-file-contents file)
+            (goto-char (point-min))
+            (and (re-search-forward "^;; Package-Version: \\(.+\\)$" nil t)
+                 (match-string 1)))))
+    (should (equal header emacs-devtools-mcp-version))))
+
 (ert-deftest emacs-devtools-mcp-tests/group-is-defined ()
   "Customization group is registered with the documented subgroups."
   :tags '(:fast)
@@ -117,7 +133,7 @@ incoming dispatches into `emacs-devtools-mcp-tests--rpc-received'."
 
 (defun emacs-devtools-mcp-tests--rpc-feed (conn bytes)
   "Inject BYTES into CONN's process filter as if read from the wire."
-  (edmcp--rpc-process-filter (edmcp--rpc-process conn) bytes))
+  (emacs-devtools-mcp-rpc--process-filter (emacs-devtools-mcp-rpc--process conn) bytes))
 
 (defun emacs-devtools-mcp-tests--rpc-encode (plist)
   "Encode PLIST through `jsonrpc--json-encode' for fixture data."
@@ -729,6 +745,75 @@ BUF is a 1-element list mutated by the client filter."
     (should-not (emacs-devtools-mcp-auth--check-token "abcd1235"))
     (should     (emacs-devtools-mcp-auth--check-token "abcd1234"))))
 
+(ert-deftest emacs-devtools-mcp-tests/notification-before-auth-closes ()
+  "A notification as the first frame closes the connection without reply.
+Notifications take a distinct dispatcher path from requests, so
+the request-side test does not cover this gate."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-server-env
+    (emacs-devtools-mcp-server-start)
+    (emacs-devtools-mcp-tests--with-client (client buf)
+      (emacs-devtools-mcp-tests--client-send
+       client '(:jsonrpc "2.0" :method "notifications/initialized"))
+      (with-timeout (3 (error "server did not close client"))
+        (while (process-live-p client)
+          (accept-process-output client 0.05)))
+      (should (equal "" (car buf))))))
+
+(ert-deftest emacs-devtools-mcp-tests/notification-after-auth-is-ignored ()
+  "`notifications/initialized' after auth is ignored; the session continues.
+Every spec-conforming MCP client sends this immediately after
+`initialize'; if this path regressed into signaling or closing,
+every real client session would break right after the handshake
+while request-only tests stayed green."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-server-env
+    (emacs-devtools-mcp-server-start)
+    (emacs-devtools-mcp-tests--with-client (client buf)
+      (let ((token emacs-devtools-mcp-auth--token))
+        (emacs-devtools-mcp-tests--client-send
+         client `(:jsonrpc "2.0" :id 1 :method "initialize"
+                  :params (:_meta (:token ,token))))
+        (should (plist-get
+                 (emacs-devtools-mcp-tests--client-await-frame client buf)
+                 :result))
+        (emacs-devtools-mcp-tests--client-send
+         client '(:jsonrpc "2.0" :method "notifications/initialized"))
+        (emacs-devtools-mcp-tests--client-send
+         client '(:jsonrpc "2.0" :id 2 :method "tools/call"
+                  :params (:name "ping" :arguments (:message "still-here"))))
+        (let* ((reply (emacs-devtools-mcp-tests--client-await-frame
+                       client buf))
+               (text (plist-get
+                      (aref (plist-get (plist-get reply :result) :content) 0)
+                      :text)))
+          (should (equal 2 (plist-get reply :id)))
+          (should (equal "pong: still-here" text)))
+        (should (process-live-p client))))))
+
+(ert-deftest emacs-devtools-mcp-tests/auth-call-after-failed-initialize-never-runs ()
+  "A `tools/call' racing the post-failure shutdown window never executes.
+`edmcp--server-shutdown-soon' defers closure to a timer tick, so a
+second frame can land after a rejected `initialize'.  It must be
+rejected (the connection is still unauthenticated) -- never
+dispatched to a tool."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-server-env
+    (emacs-devtools-mcp-server-start)
+    (emacs-devtools-mcp-tests--with-client (client buf)
+      (emacs-devtools-mcp-tests--client-send
+       client '(:jsonrpc "2.0" :id 1 :method "initialize"
+                :params (:_meta (:token "wrong"))))
+      (emacs-devtools-mcp-tests--client-send
+       client '(:jsonrpc "2.0" :id 2 :method "tools/call"
+                :params (:name "ping" :arguments nil)))
+      (let ((first (emacs-devtools-mcp-tests--client-await-frame client buf)))
+        (should (eq -32600 (plist-get (plist-get first :error) :code))))
+      (with-timeout (3 (error "server did not close client"))
+        (while (process-live-p client)
+          (accept-process-output client 0.05)))
+      (should-not (string-match-p "pong" (car buf))))))
+
 ;;;; ___Registry___
 ;;
 ;; `emacs-devtools-mcp-deftool' macro + JSON-Schema-subset validator.
@@ -1081,6 +1166,47 @@ return its slow value."
       (let* ((rec (gethash "slow_tool" emacs-devtools-mcp--tool-registry))
              (handler (plist-get rec :handler)))
         (should-error (funcall handler nil) :type 'jsonrpc-error)))))
+
+(ert-deftest emacs-devtools-mcp-tests/deftool-slow-timeout-is-32000 ()
+  "The slow-tool timeout error carries code -32000 and says \"timed out\".
+`deftool-slow-times-out' only pins the error type; a regression to
+a different code or message would change the wire contract without
+failing it."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-fresh-registry
+    (let ((emacs-devtools-mcp-slow-tool-timeout 0.05))
+      (eval
+       '(emacs-devtools-mcp-deftool slow-code
+            "Slow."
+          :cost :slow
+          :handler (lambda (_p) (sleep-for 1) :unreachable))
+       t)
+      (let* ((rec (gethash "slow_code" emacs-devtools-mcp--tool-registry))
+             (handler (plist-get rec :handler))
+             (err (should-error (funcall handler nil)
+                                :type 'jsonrpc-error)))
+        (should (eq -32000 (alist-get 'jsonrpc-error-code (cdr err))))
+        (should (string-match-p
+                 "timed out"
+                 (alist-get 'jsonrpc-error-message (cdr err))))))))
+
+(ert-deftest emacs-devtools-mcp-tests/deftool-slow-handler-may-return-t ()
+  "A `:slow' handler legitimately returning t is not \"interrupted\".
+`while-no-input' yields literal t when input arrives; the wrapper
+cons-wraps the handler value so a t-returning handler cannot be
+mistaken for that sentinel and bounced as -32000."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-fresh-registry
+    (let ((emacs-devtools-mcp-slow-tool-timeout 5))
+      (eval
+       '(emacs-devtools-mcp-deftool slow-t
+            "Returns t."
+          :cost :slow
+          :handler (lambda (_p) t))
+       t)
+      (let* ((rec (gethash "slow_t" emacs-devtools-mcp--tool-registry))
+             (handler (plist-get rec :handler)))
+        (should (eq t (funcall handler nil)))))))
 
 (ert-deftest emacs-devtools-mcp-tests/deftool-slow-runs-when-fast ()
   "A `:slow' handler that returns under the deadline returns its value."
@@ -1437,6 +1563,30 @@ Verifies that schema-validated arguments reach the handler intact."
                  '(:name "needs_int" :arguments (:n "string-not-int")))
                 :type 'jsonrpc-error)))
       (should (eq -32602 (alist-get 'jsonrpc-error-code (cdr err)))))))
+
+(ert-deftest emacs-devtools-mcp-tests/dispatch-reraises-handler-jsonrpc-error ()
+  "A `jsonrpc-error' raised inside a handler propagates as a protocol error.
+Pins the re-raise clause in `edmcp--server-tools-call': protocol
+conditions a handler synthesizes deliberately (slow-tool timeout,
+bogus pagination cursor) must reach the client as JSON-RPC errors,
+not `isError' envelopes."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-fresh-registry
+    (eval
+     '(emacs-devtools-mcp-deftool raise-proto
+          "Raises a deliberate protocol error."
+        :handler (lambda (_p)
+                   (jsonrpc-error :code -32602
+                                  :message "Invalid or expired cursor")))
+     t)
+    (let ((err (should-error
+                (emacs-devtools-mcp-server-default-dispatcher
+                 nil 'tools/call '(:name "raise_proto" :arguments nil))
+                :type 'jsonrpc-error)))
+      (should (eq -32602 (alist-get 'jsonrpc-error-code (cdr err))))
+      (should (string-match-p "cursor"
+                              (alist-get 'jsonrpc-error-message
+                                         (cdr err)))))))
 
 (ert-deftest emacs-devtools-mcp-tests/dispatch-handler-error-becomes-content-block ()
   "Handler-raised errors become success replies with `isError: t'."
@@ -2124,7 +2274,16 @@ swallowing legitimate sharp-syntax."
   (should (= 255 (edmcp--spawn-parse-reply "#16rFF\n")))
   (should (= 255 (edmcp--spawn-parse-reply "#xFF\n")))
   (should (equal '(:a 1 :b "two")
-                 (edmcp--spawn-parse-reply "(:a 1 :b \"two\")\n"))))
+                 (edmcp--spawn-parse-reply "(:a 1 :b \"two\")\n")))
+  ;; `#[' byte-code literals deliberately pass the scan: never funcalled
+  ;; by any consumer, and `json-serialize' refuses them into the bounded
+  ;; error path.  Pins the accept side so an over-tightened regex that
+  ;; swallows `#[' (or `#s') would fail here.
+  (should (byte-code-function-p
+           (edmcp--spawn-parse-reply "#[0 \"\\300\\207\" [42] 1]\n")))
+  (should (hash-table-p
+           (edmcp--spawn-parse-reply
+            "#s(hash-table test eq data (a 1))\n"))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-parse-reply-rejects-macro-inside-string ()
   "The scan is position-blind: `#.'/`#@' anywhere in a reply is rejected.
@@ -2517,7 +2676,7 @@ it with -- the package never controlled it."
      (let ((rec (emacs-devtools-mcp-spawn-attach "edmcp-other-daemon")))
        (should (eq 'host-inherit (plist-get rec :display-mode)))
        (should (null (plist-get rec :proc)))
-       (let ((public (edmcp--spawn-record-public rec)))
+       (let ((public (emacs-devtools-mcp-spawn--record-public rec)))
          (should (equal "host-inherit" (plist-get public :display_mode))))))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-env-without-strips-vars ()
@@ -3237,7 +3396,7 @@ listens on a socket; the host MCP server proxies tool calls in via
            (let* ((rec (emacs-devtools-mcp-spawn-attach sn))
                   (handle (plist-get rec :handle)))
              (should (eq t (plist-get
-                            (edmcp--spawn-record-public rec) :attached)))
+                            (emacs-devtools-mcp-spawn--record-public rec) :attached)))
              (should (equal 4
                             (emacs-devtools-mcp-spawn-call
                              (list :spawn handle) '(+ 2 2))))
@@ -3297,6 +3456,13 @@ listens on a socket; the host MCP server proxies tool calls in via
     (should (string-match-p "boom" (plist-get res :error)))
     (should-not (plist-get res :value))))
 
+(ert-deftest emacs-devtools-mcp-tests/eval-run-respects-print-length ()
+  "PRINT-LENGTH bounds long-list rendering."
+  :tags '(:fast)
+  (let ((res (emacs-devtools-mcp-tools-eval--run '(make-list 10 'a) 6 3)))
+    (should (string-match-p "\\.\\.\\." (plist-get res :value)))
+    (should-not (string-match-p "a a a a" (plist-get res :value)))))
+
 (ert-deftest emacs-devtools-mcp-tests/eval-run-respects-print-level ()
   "PRINT-LEVEL bounds nested-list rendering."
   :tags '(:fast)
@@ -3319,6 +3485,108 @@ listens on a socket; the host MCP server proxies tool calls in via
   :tags '(:fast)
   (let ((res (edmcp--tools-eval-elisp '(:form "(* 6 7)"))))
     (should (equal "42" (plist-get res :value)))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-answers-y-or-n-p ()
+  "A boolean answer satisfies `y-or-n-p'; the transcript records it."
+  :tags '(:fast)
+  (let* ((res (emacs-devtools-mcp-tools-eval--run-with-answers
+               '(if (y-or-n-p "ok? ") :yes :no) 6 100 '(t)))
+         (prompts (plist-get res :prompts)))
+    (should (equal ":yes" (plist-get res :value)))
+    (should (= 1 (length prompts)))
+    (let ((p (aref prompts 0)))
+      (should (equal "y-or-n-p" (plist-get p :type)))
+      (should (equal "ok? " (plist-get p :prompt)))
+      (should (eq t (plist-get p :answered)))
+      (should (eq t (plist-get p :answer))))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-answers-json-false-means-no ()
+  "`:json-false' answers a boolean prompt with no."
+  :tags '(:fast)
+  (let ((res (emacs-devtools-mcp-tools-eval--run-with-answers
+              '(if (yes-or-no-p "sure? ") :yes :no) 6 100 '(:json-false))))
+    (should (equal ":no" (plist-get res :value)))
+    (should (eq :json-false
+                (plist-get (aref (plist-get res :prompts) 0) :answer)))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-answers-mixed-queue-in-order ()
+  "Mixed boolean/string answers are consumed strictly in prompt order."
+  :tags '(:fast)
+  (let ((res (emacs-devtools-mcp-tools-eval--run-with-answers
+              '(list (y-or-n-p "first? ")
+                     (read-string "second: ")
+                     (read-from-minibuffer "third: "))
+              6 100 '(t "two" "three"))))
+    (should (equal "(t \"two\" \"three\")" (plist-get res :value)))
+    (should (= 3 (length (plist-get res :prompts))))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-answers-covers-completing-read ()
+  "`completing-read' is answered via the `read-from-minibuffer' override."
+  :tags '(:fast)
+  (let ((res (emacs-devtools-mcp-tools-eval--run-with-answers
+              '(completing-read "pick: " '("alpha" "beta") nil t)
+              6 100 '("beta"))))
+    (should (equal "\"beta\"" (plist-get res :value)))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-answers-exhausted-fails-fast ()
+  "An unanswered prompt errors immediately and lands in the transcript.
+This is the discovery flow: call with empty answers, read the
+transcript, retry.  The prompt must NOT block until the slow-tool
+timeout."
+  :tags '(:fast)
+  (let* ((res (emacs-devtools-mcp-tools-eval--run-with-answers
+               '(y-or-n-p "what now? ") 6 100 nil))
+         (p (aref (plist-get res :prompts) 0)))
+    (should (string-match-p "Unanswered y-or-n-p prompt"
+                            (plist-get res :error)))
+    (should (string-match-p "what now?" (plist-get res :error)))
+    (should-not (plist-get res :value))
+    (should (eq :json-false (plist-get p :answered)))
+    (should-not (plist-member p :answer))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-answers-type-mismatch-fails-fast ()
+  "A wrong-kind next answer does not satisfy the prompt.
+A string queued where `y-or-n-p' asks must not be coerced to a
+boolean; the prompt is reported unanswered so the caller can fix
+the queue rather than get a silently-guessed answer."
+  :tags '(:fast)
+  (let ((res (emacs-devtools-mcp-tools-eval--run-with-answers
+              '(y-or-n-p "really? ") 6 100 '("yes"))))
+    (should (string-match-p "Unanswered y-or-n-p prompt"
+                            (plist-get res :error)))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-answers-prompt-text-redacted ()
+  "Prompt text in the transcript passes through the redaction layer."
+  :tags '(:fast)
+  (let* ((res (emacs-devtools-mcp-tools-eval--run-with-answers
+               '(y-or-n-p "auth-source-cache expired; refresh? ") 6 100 '(t)))
+         (p (aref (plist-get res :prompts) 0)))
+    (should (equal "" (plist-get p :prompt)))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-handler-answers-roundtrip ()
+  "Handler-level: wire-shaped `:answers' vector reaches the runner."
+  :tags '(:fast)
+  (let ((res (edmcp--tools-eval-elisp
+              '(:form "(if (y-or-n-p \"go? \") 1 0)" :answers [t]))))
+    (should (equal "1" (plist-get res :value)))
+    (should (= 1 (length (plist-get res :prompts))))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-handler-answers-absent-unchanged ()
+  "Without `:answers' the plain runner is used; no `:prompts' key."
+  :tags '(:fast)
+  (let ((res (edmcp--tools-eval-elisp '(:form "(* 2 3)"))))
+    (should (equal "6" (plist-get res :value)))
+    (should-not (plist-member res :prompts))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-handler-bad-answers-raises-32602 ()
+  "A non-boolean/string answers element is invalid params."
+  :tags '(:fast)
+  (let ((err (should-error
+              (edmcp--tools-eval-elisp '(:form "t" :answers [42]))
+              :type 'jsonrpc-error)))
+    (should (= -32602 (alist-get 'jsonrpc-error-code (cdr err))))
+    (should (string-match-p "answers\\[0\\]"
+                            (alist-get 'jsonrpc-error-message (cdr err))))))
 
 ;;;; ___Debug (edebug / backtrace / trace)___
 ;;
@@ -4106,6 +4374,15 @@ The reader successfully turns the string into a symbol, but
   (should-error
    (edmcp--tools-ert-run
     '(:selector "edmcp-no-such-ert-test-anywhere-42"))))
+
+(ert-deftest emacs-devtools-mcp-tests/ert-run-rejects-reader-label-selector ()
+  "`#N='/`#N#' reader labels in a selector string are refused.
+A circular selector would otherwise spin selector matching until
+the slow-tool timeout; the scan rejects it outright, aligned with
+the spawn-reply scanner via `emacs-devtools-mcp-unsafe-reader-re'."
+  :tags '(:fast)
+  (should-error (edmcp--ert-parse-selector "#1=(member . #1#)"))
+  (should-error (edmcp--tools-ert-run '(:selector "#1=(member . #1#)"))))
 
 (ert-deftest emacs-devtools-mcp-tests/ert-run-accepts-tag-selector ()
   "A `(tag :tagname)' selector runs every loaded test with that tag.
@@ -5233,6 +5510,45 @@ the cap and the comparison both surface as areas."
     (should (eq 'unavailable
                 (emacs-devtools-mcp-tools-gui--probe-host-backend)))))
 
+(ert-deftest emacs-devtools-mcp-tests/probe-host-backend-does-not-latch-unavailable ()
+  "A failed probe is not cached; a later GUI frame is picked up.
+Regression: the probe used to latch `unavailable' forever, so a
+daemon whose first GUI client frame appeared after the first
+screenshot attempt could never screenshot again without a manual
+variable reset."
+  :tags '(:fast)
+  (skip-unless noninteractive)
+  (let ((emacs-devtools-mcp-tools-gui--host-backend nil))
+    (should (eq 'unavailable
+                (emacs-devtools-mcp-tools-gui--probe-host-backend)))
+    (should-not emacs-devtools-mcp-tools-gui--host-backend)
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'x-export-frames)
+               (lambda (&optional _frames _type)
+                 "\x89PNG\r\n\x1a\n........")))
+      (should (eq 'x-export-frames
+                  (emacs-devtools-mcp-tools-gui--probe-host-backend))))
+    (should (eq 'x-export-frames
+                emacs-devtools-mcp-tools-gui--host-backend))))
+
+(ert-deftest emacs-devtools-mcp-tests/probe-host-backend-scans-frame-list ()
+  "The probe finds a graphical frame even when the selected one is not.
+The daemon topology: dispatch over the server socket can run with
+the daemon's dumb terminal frame selected while a GUI client frame
+exists.  Stub `display-graphic-p' to say the selected frame (no-arg
+call) is non-graphic but any explicit frame is graphic."
+  :tags '(:fast)
+  (skip-unless noninteractive)
+  (let ((emacs-devtools-mcp-tools-gui--host-backend nil))
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (lambda (&optional display) (and display t)))
+              ((symbol-function 'x-export-frames)
+               (lambda (&optional _frames _type)
+                 "\x89PNG\r\n\x1a\n........")))
+      (should (eq 'x-export-frames
+                  (emacs-devtools-mcp-tools-gui--probe-host-backend))))))
+
 (ert-deftest emacs-devtools-mcp-tests/probe-host-backend-asks-for-png ()
   "Probe must call `x-export-frames' with TYPE=png, not the PDF default.
 Without the explicit format the trial export returns PDF bytes
@@ -5578,6 +5894,19 @@ it.  Caller is responsible for writing content to FILE."
     (should-error
      (edmcp--tools-init-bisect
       (list :file file :predicate "#.(delete-file \"/tmp/never\")"))
+     :type 'emacs-devtools-mcp-init-error)))
+
+(ert-deftest emacs-devtools-mcp-tests/init-bisect-rejects-reader-label-predicate ()
+  "A predicate carrying `#N='/`#N#' labels is refused before any spawn.
+Labels build shared/circular structure (the print amplifier); the
+init scanner shares `emacs-devtools-mcp-unsafe-reader-re' with the
+spawn-reply scanner so the rejected set cannot drift."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-init-fixture (dir file)
+    (with-temp-file file (insert "(setq x 1)\n"))
+    (should-error
+     (edmcp--tools-init-bisect
+      (list :file file :predicate "#1=(or (boundp 'x) #1#)"))
      :type 'emacs-devtools-mcp-init-error)))
 
 (ert-deftest emacs-devtools-mcp-tests/init-bisect-handler-rejects-empty-predicate ()
