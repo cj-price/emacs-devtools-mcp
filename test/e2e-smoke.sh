@@ -147,12 +147,19 @@ fi
 echo "PASS initialize           protocolVersion=$init_proto"
 PASS=$((PASS + 1))
 
-# tools/list smoke -- count must equal the registry size.
+# tools/list smoke -- count must equal the registry size, derived
+# from the deftool call sites in lisp/ so adding or removing a tool
+# cannot silently drift past a hard-coded threshold.
+# `|| true' so a zero-match grep (exit 1) under `set -o pipefail' yields
+# expected_tools=0 and fails loudly at the `-ne' check below, rather than
+# killing the script with no diagnostic.
+expected_tools="$(grep -h '^(emacs-devtools-mcp-deftool ' "$ROOT"/lisp/*.el | wc -l || true)"
 jq -nc '{jsonrpc:"2.0", id:99, method:"tools/list"}' >&3
 IFS= read -r -t 30 -u 4 list_line
 tool_count="$(jq '.result.tools | length' <<<"$list_line")"
-if [ "$tool_count" -lt 30 ]; then
-  echo "FAIL tools/list returned only $tool_count tools" >&2; exit 1
+if [ "$tool_count" -ne "$expected_tools" ]; then
+  echo "FAIL tools/list returned $tool_count tools; lisp/ defines $expected_tools" >&2
+  exit 1
 fi
 echo "PASS tools/list           count=$tool_count"
 PASS=$((PASS + 1))

@@ -183,6 +183,28 @@ uses the standard response cap."
   (> (string-bytes (jsonrpc--json-encode envelope))
      (edmcp--server-response-cap envelope)))
 
+(defconst edmcp--server-error-print-level 8
+  "`print-level' cap applied when formatting tool-error data.")
+
+(defconst edmcp--server-error-print-length 200
+  "`print-length' cap applied when formatting tool-error data.")
+
+(defun edmcp--server-error-text (err)
+  "Return ERR's message as text, with the printer bounded.
+ERR is a caught error condition.  Tool-execution errors carry
+arbitrary data -- including, on the spawn path, a value `read'
+from an untrusted daemon reply.  A shared or circular structure
+in that data expands exponentially under the default
+`print-circle' nil, so `error-message-string' on it could exhaust
+host memory from a sub-kilobyte reply.  Bind `print-circle' t and
+finite level/length caps so the formatted message stays bounded
+no matter what the data contains; normal string-message errors
+are unaffected (the caps only bite on nested structure)."
+  (let ((print-circle t)
+        (print-level edmcp--server-error-print-level)
+        (print-length edmcp--server-error-print-length))
+    (error-message-string err)))
+
 (defun edmcp--server-payload-too-large-envelope (cap)
   "Return the canonical `payload_too_large' tool-result envelope.
 CAP is the byte cap that the over-cap envelope exceeded; it is
@@ -249,7 +271,7 @@ JSON-RPC error code."
                  (error
                   (list :content
                         (vector (list :type "text"
-                                      :text (error-message-string err)))
+                                      :text (edmcp--server-error-text err)))
                         :isError t)))))
           (if (edmcp--server-too-large-p envelope)
               (edmcp--server-payload-too-large-envelope

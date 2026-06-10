@@ -2082,6 +2082,28 @@ Restores the original hash on exit so tests don't bleed."
               :type 'emacs-devtools-mcp-spawn-error)))
     (should (string-match-p "rejected" (cadr err)))))
 
+(ert-deftest emacs-devtools-mcp-tests/spawn-parse-reply-rejects-reader-skip ()
+  "`#@COUNT' in daemon reply is rejected without calling `read'.
+`#@' silently skips COUNT characters, so a reply could smuggle
+content past the reader; the pre-scan treats it like `#.'."
+  :tags '(:fast)
+  (let ((err (should-error
+              (edmcp--spawn-parse-reply "#@13\"smuggled\"(:ok t)\n")
+              :type 'emacs-devtools-mcp-spawn-error)))
+    (should (string-match-p "rejected" (cadr err)))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-parse-reply-rejects-macro-inside-string ()
+  "The scan is position-blind: `#.'/`#@' anywhere in a reply is rejected.
+This pins the deliberate trade-off -- a legitimate reply whose
+printed value merely *contains* the two-char sequence inside a
+string literal is rejected rather than parsed selectively.  Both
+the rare `#.' and the `.elc'-common `#@' trip it."
+  :tags '(:fast)
+  (dolist (raw '("(:text \"see #.foo in init\")\n"
+                 "(:text \"byte-code marker #@42 here\")\n"))
+    (should-error (edmcp--spawn-parse-reply raw)
+                  :type 'emacs-devtools-mcp-spawn-error)))
+
 (ert-deftest emacs-devtools-mcp-tests/spawn-parse-reply-empty-signals ()
   "Empty reply signals a structured error rather than `end-of-file'."
   :tags '(:fast)
@@ -2348,6 +2370,16 @@ selecting the answer."
   (dolist (m emacs-devtools-mcp-spawn-display-modes)
     (let ((emacs-devtools-mcp-spawn-default-display-mode m))
       (should (eq m (edmcp--spawn-resolve-display-mode nil))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-resolve-display-mode-unknown-signals ()
+  "An unknown display-mode symbol signals a structured spawn error.
+Pins the promise in `edmcp--spawn-resolve-display-mode's
+docstring: clients get a structured error, not a `pcase'
+fall-through later in the launch pipeline."
+  :tags '(:fast)
+  (let ((err (should-error (edmcp--spawn-resolve-display-mode 'wayland-please)
+                           :type 'emacs-devtools-mcp-spawn-error)))
+    (should (string-match-p "unknown display-mode" (cadr err)))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-tool-schema-display-mode-accepts-known-and-null ()
   "`spawn_emacs' schema accepts each enum member, null, and omission."
@@ -4160,6 +4192,59 @@ a JSON array; a plain list would be encoded as an alist/object."
                               (plist-get (aref (plist-get envelope :content) 0)
                                          :text))))))
 
+(defun emacs-devtools-mcp-tests--shared-structure-dag (depth)
+  "Return a DEPTH-level shared-structure cons DAG read from labels.
+Each level references the previous labeled node twice, so the
+value prints to roughly 2^DEPTH bytes under `print-circle' nil
+while the reader input stays small -- the amplification shape a
+hostile or buggy daemon reply could carry."
+  (let ((s "#1=0") (k 1))
+    (while (< k depth)
+      (setq k (1+ k))
+      ;; Embed the prior labeled definition in the car and reference it
+      ;; once more in the cdr, so every label stays defined and the
+      ;; printed expansion doubles per level.
+      (setq s (format "#%d=(%s . #%d#)" k s (1- k))))
+    (car (read-from-string s))))
+
+(ert-deftest emacs-devtools-mcp-tests/server-error-text-bounds-shared-structure ()
+  "`edmcp--server-error-text' keeps a shared-structure error datum bounded.
+A daemon reply read into a shared-structure DAG expands ~2^N
+under the default `print-circle' nil, so `error-message-string'
+on it could exhaust host memory.  The helper binds `print-circle'
+t plus finite caps; the same datum formatted with the default
+printer explodes, proving the cap is load-bearing."
+  :tags '(:fast)
+  (let* ((dag (emacs-devtools-mcp-tests--shared-structure-dag 16))
+         (err (list 'wrong-type-argument (list 'json-value-p dag))))
+    ;; Default printing of this 16-level DAG is ~131 KB; the helper
+    ;; collapses the shared references and bounds level/length.
+    (should (> (length (error-message-string err)) 50000))
+    (should (< (length (edmcp--server-error-text err)) 4096))))
+
+(ert-deftest emacs-devtools-mcp-tests/tools-call-error-envelope-bounds-shared-structure ()
+  "A handler error carrying a shared-structure datum yields a bounded envelope.
+Exercises the full `tools/call' error path: the amplifying datum
+a spawn reply could smuggle is formatted through
+`edmcp--server-error-text', so the envelope stays small and
+`isError' rather than exhausting memory in `error-message-string'."
+  :tags '(:fast)
+  (let ((emacs-devtools-mcp--tool-registry (make-hash-table :test 'equal))
+        (dag (emacs-devtools-mcp-tests--shared-structure-dag 16)))
+    (eval `(emacs-devtools-mcp-deftool boom
+               "Signals an error carrying a shared-structure datum."
+             :cost :fast
+             :read-only t
+             :handler (lambda (_p)
+                        (signal 'wrong-type-argument
+                                (list 'json-value-p ',dag))))
+          t)
+    (let* ((envelope (edmcp--server-tools-call
+                      nil '(:name "boom" :arguments nil)))
+           (text (plist-get (aref (plist-get envelope :content) 0) :text)))
+      (should (eq t (plist-get envelope :isError)))
+      (should (< (length text) 8192)))))
+
 (ert-deftest emacs-devtools-mcp-tests/payload-cap-under-budget-passes ()
   "When the response is under the cap, the handler's content is preserved."
   :tags '(:fast)
@@ -4459,6 +4544,37 @@ noise for agents trying to discover keystrokes."
                     `(:keys "C-c a x"
                       :keymap ,(symbol-name map-sym)))))
           (should (integerp (plist-get res :prefix))))
+      (makunbound map-sym)
+      (unintern map-sym nil))))
+
+(ert-deftest emacs-devtools-mcp-tests/lookup-key-prefix-keymap-reports-keymap ()
+  "A key terminating inside a prefix keymap reports `(:keymap t)'.
+The keymap value itself must never reach the wire -- it is not
+JSON-serializable and would not survive the spawn round-trip."
+  :tags '(:fast)
+  (let ((res (edmcp--tools-lookup-key '(:keys "C-x"))))
+    (should (eq t (plist-get res :keymap)))
+    (should-not (plist-get res :binding))))
+
+(ert-deftest emacs-devtools-mcp-tests/lookup-key-accept-default ()
+  "`accept_default' surfaces a keymap's `[t]' default binding.
+Without it the same lookup reports `\"undefined\"'."
+  :tags '(:fast)
+  (let* ((map (make-sparse-keymap))
+         (map-sym (intern (format "edmcp-default-keymap-%d" (random 100000)))))
+    (define-key map [t] 'ignore)
+    (define-key map (kbd "a") 'forward-char)
+    (set map-sym map)
+    (unwind-protect
+        (let ((with-default
+               (edmcp--tools-lookup-key
+                `(:keys "b" :keymap ,(symbol-name map-sym)
+                  :accept_default t)))
+              (without-default
+               (edmcp--tools-lookup-key
+                `(:keys "b" :keymap ,(symbol-name map-sym)))))
+          (should (equal "ignore" (plist-get with-default :binding)))
+          (should (equal "undefined" (plist-get without-default :binding))))
       (makunbound map-sym)
       (unintern map-sym nil))))
 
@@ -5113,7 +5229,12 @@ frame, then drives the real `screenshot_frame' handler with a
 `:spawn' target.  Asserts the returned base64 decodes to a real
 PNG (magic header + non-trivial size).  Skipped when no DISPLAY
 is set or when the subordinate cannot create a graphical frame
-\(e.g. Emacs built without X support)."
+\(e.g. Emacs built without X support).
+
+WAYLAND_DISPLAY is scrubbed for the spawn: on a Wayland host,
+`host-inherit' would otherwise drop the X11 DISPLAY this test
+depends on (that drop has its own unit tests), turning this test
+into a permanent skip on Wayland machines."
   :tags '(:gui)
   (skip-unless (emacs-devtools-mcp-tests--daemon-available-p))
   (skip-unless (and (getenv "DISPLAY")
@@ -5123,7 +5244,9 @@ is set or when the subordinate cannot create a graphical frame
           (or (locate-library "emacs-devtools-mcp-tools-gui")
               (error "package not on load-path -- run via `make test-gui'")))))
     (emacs-devtools-mcp-tests--with-empty-handles
-     (let* ((rec (emacs-devtools-mcp-spawn-spawn))
+     (let* ((rec (let ((process-environment
+                        (edmcp--spawn-env-without '("WAYLAND_DISPLAY"))))
+                   (emacs-devtools-mcp-spawn-spawn)))
             (handle (plist-get rec :handle))
             (target (list :spawn handle)))
        (unwind-protect

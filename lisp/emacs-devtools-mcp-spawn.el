@@ -55,9 +55,12 @@
 ;; The eval round-trip routes through `emacsclient -s NAME --eval
 ;; STR'.  STR is built via `prin1-to-string' over an explicit argv
 ;; list -- never a shell.  The daemon's reply is pre-scanned for the
-;; `#.' read-time eval reader macro and rejected if present, so a
-;; compromised or buggy daemon cannot drive code execution in the host
-;; through the `read' that decodes the reply.
+;; `#.' read-time eval reader macro (and `#@', for parity with the
+;; agent-input scanners) and rejected if present, so a compromised or
+;; buggy daemon cannot drive code execution in the host through the
+;; `read' that decodes the reply.  The decoded value is JSON-
+;; serialized, never funcalled; the residual amplification risk from a
+;; shared/circular reply is bounded by the error-path print caps.
 
 ;;; Code:
 
@@ -595,21 +598,32 @@ was already dead'."
 
 (add-hook 'kill-emacs-hook #'emacs-devtools-mcp-spawn-kill-all)
 
-(defconst edmcp--spawn-reader-eval-re "#\\."
-  "Matches the `#.' read-time-eval reader macro in raw output.
-We reject any daemon reply containing this sequence rather than
-attempt to parse selectively, because Emacs's `read' has no
-documented switch to inhibit `#.' evaluation.")
+(defconst edmcp--spawn-unsafe-reader-re "#[.@]"
+  "Matches the `#.' and `#@' reader macros in raw daemon output.
+`#.' is the load-bearing case: it is read-time `eval', and Emacs
+`read' has no documented switch to inhibit it, so a reply
+carrying `#.' could execute code in the host.  `#@COUNT' (skip
+COUNT characters) executes nothing, but is rejected too, for
+parity with the agent-input scanners in
+`emacs-devtools-mcp-tools-init' / `-tools-buffer' and as
+defense-in-depth against a reply desynchronizing the reader.
+This scan is deliberately position-blind and does not claim to
+stop every hostile construct: reader labels (`#N='/`#N#') and
+byte-code literals (`#[') pass through.  Those are not code-
+execution vectors here -- the parsed value is JSON-serialized,
+never funcalled -- and the only residual risk, a shared/circular
+structure amplifying when printed, is bounded separately by the
+print caps on the error path (see `edmcp--server-error-text').")
 
 (defun edmcp--spawn-parse-reply (raw)
   "Parse RAW emacsclient reply text into the corresponding Lisp value.
-Pre-scans for the `#.' reader macro and refuses to call `read' on
-a reply that contains it.  Distinguishes truly empty input
-\(\"empty reply\") from input that begins parsing but fails
-\(\"unreadable\")."
-  (when (string-match-p edmcp--spawn-reader-eval-re raw)
+Pre-scans for the `#.' and `#@' reader macros and refuses to call
+`read' on a reply that contains either.  Distinguishes truly
+empty input (\"empty reply\") from input that begins parsing but
+fails (\"unreadable\")."
+  (when (string-match-p edmcp--spawn-unsafe-reader-re raw)
     (signal 'emacs-devtools-mcp-spawn-error
-            (list "rejected `#.' in daemon reply" (string-trim raw))))
+            (list "rejected `#.'/`#@' in daemon reply" (string-trim raw))))
   (when (or (null raw) (string-empty-p (string-trim raw)))
     (signal 'emacs-devtools-mcp-spawn-error
             (list "empty reply from emacsclient")))
@@ -629,8 +643,8 @@ a reply that contains it.  Distinguishes truly empty input
 HANDLE selects the daemon record; FORM is serialized via
 `prin1-to-string' and passed as a single argv element to
 `emacsclient' -- no shell, no quoting hazards.  The reply is
-filtered through `edmcp--spawn-parse-reply' which rejects any
-`#.' reader macro before calling `read'."
+filtered through `edmcp--spawn-parse-reply' which rejects the
+`#.' and `#@' reader macros before calling `read'."
   (let* ((rec (edmcp--spawn-lookup handle))
          (server-name (plist-get rec :server-name))
          (form-str
@@ -657,7 +671,7 @@ TARGET is nil, `(:host t)', or `(:spawn HANDLE)'.  When TARGET
 selects host, FORM is evaluated lexically in the running Emacs.
 When TARGET selects a spawn handle, FORM is sent to that
 subordinate Emacs over `emacsclient --eval' and the reply is
-parsed after pre-scanning for the `#.' reader macro."
+parsed after pre-scanning for the `#.' and `#@' reader macros."
   (cond
    ((or (null target) (plist-get target :host))
     (eval form t))
