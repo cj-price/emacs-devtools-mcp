@@ -2934,10 +2934,10 @@ single-arm regression doesn't pass the existing tests."
   (emacs-devtools-mcp-tests--with-empty-handles
    (let* ((emacs-devtools-mcp-spawn-idle-timeout 60)
           (now (float-time))
-          (kill-calls nil))
-     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
-                (lambda (_program args &optional _b)
-                  (push args kill-calls) (cons 0 ""))))
+          (signalled nil))
+     (cl-letf (((symbol-function 'process-attributes) (lambda (_pid) nil))
+               ((symbol-function 'signal-process)
+                (lambda (pid _sig) (push pid signalled) 0)))
        (puthash "fresh"
                 (list :handle "fresh" :server-name "edmcp-spawn-fresh"
                       :pid 1 :display-mode 'host-inherit :init nil :attached nil
@@ -2951,16 +2951,17 @@ single-arm regression doesn't pass the existing tests."
        (edmcp--spawn-reaper-tick)
        (should (gethash "fresh" emacs-devtools-mcp-spawn--handles))
        (should-not (gethash "stale" emacs-devtools-mcp-spawn--handles))
-       (should (cl-some (lambda (a) (member "edmcp-spawn-stale" a))
-                        kill-calls))))))
+       (should (member 2 signalled))
+       (should-not (member 1 signalled))))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-kill-all-empties-table ()
   "`spawn-kill-all' drops every record and cancels the reaper timer."
   :tags '(:fast)
   (emacs-devtools-mcp-tests--with-empty-handles
    (let ((now (float-time)))
-     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
-                (lambda (&rest _) (cons 0 ""))))
+     (cl-letf (((symbol-function 'process-attributes) (lambda (_pid) nil))
+               ((symbol-function 'signal-process)
+                (lambda (&rest _) 0)))
        (puthash "h1" (list :handle "h1" :server-name "edmcp-spawn-h1"
                            :pid 1 :display-mode 'host-inherit :init nil :attached nil
                            :created now :last-used now)
@@ -3011,15 +3012,17 @@ murder the user's real Emacs."
          (should (eq 'attached (plist-get dropped :kill-status))))
        (should-not calls)))))
 
-(ert-deftest emacs-devtools-mcp-tests/spawn-kill-spawned-sends-kill-emacs ()
-  "Killing a non-attached handle still runs the `(kill-emacs)' RPC."
+(ert-deftest emacs-devtools-mcp-tests/spawn-kill-spawned-sigterms-pid ()
+  "Killing a non-attached handle SIGTERMs the recorded PID directly.
+The signal goes to the PID rather than over `emacsclient' so a
+daemon wedged on a blocking read is still terminated."
   :tags '(:fast)
   (emacs-devtools-mcp-tests--with-empty-handles
    (let ((now (float-time))
-         (calls nil))
-     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
-                (lambda (_program args &optional _b)
-                  (push args calls) (cons 0 ""))))
+         (signals nil))
+     (cl-letf (((symbol-function 'process-attributes) (lambda (_pid) nil))
+               ((symbol-function 'signal-process)
+                (lambda (pid sig) (push (cons pid sig) signals) 0)))
        (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
                            :pid 2 :display-mode 'host-inherit :init nil :attached nil
                            :created now :last-used now)
@@ -3027,24 +3030,78 @@ murder the user's real Emacs."
        (let ((dropped (emacs-devtools-mcp-spawn-kill "sp")))
          (should-not (gethash "sp" emacs-devtools-mcp-spawn--handles))
          (should (eq 'killed (plist-get dropped :kill-status))))
-       (should (cl-some (lambda (a)
-                          (and (member "edmcp-spawn-sp" a)
-                               (member "(kill-emacs)" a)))
-                        calls))))))
+       (should (member '(2 . SIGTERM) signals))))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-kill-spawned-already-dead ()
-  "Non-zero rc from emacsclient marks the kill as `already-dead'."
+  "A SIGTERM to a vanished PID marks the kill as `already-dead'."
   :tags '(:fast)
   (emacs-devtools-mcp-tests--with-empty-handles
    (let ((now (float-time)))
-     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
-                (lambda (&rest _) (cons 1 "no daemon"))))
+     (cl-letf (((symbol-function 'process-attributes) (lambda (_pid) nil))
+               ((symbol-function 'signal-process)
+                (lambda (&rest _) (error "No such process"))))
        (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
                            :pid 3 :display-mode 'host-inherit :init nil :attached nil
                            :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (let ((dropped (emacs-devtools-mcp-spawn-kill "sp")))
          (should (eq 'already-dead (plist-get dropped :kill-status))))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-kill-foreign-pid-spared ()
+  "A recycled PID now owned by a non-Emacs process is NOT signalled.
+`process-attributes' reporting a foreign `comm' makes the kill
+report `already-dead' without ever calling `signal-process' -- the
+PID-reuse guard against terminating an innocent process."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let ((now (float-time))
+         (signalled nil))
+     (cl-letf (((symbol-function 'process-attributes)
+                (lambda (_pid) '((comm . "rustc") (euid . 0))))
+               ((symbol-function 'signal-process)
+                (lambda (&rest _) (push t signalled) 0)))
+       (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
+                           :pid 4242 :display-mode 'host-inherit :init nil :attached nil
+                           :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (let ((dropped (emacs-devtools-mcp-spawn-kill "sp")))
+         (should (eq 'already-dead (plist-get dropped :kill-status))))
+       (should-not signalled)))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-kill-same-uid-emacs-pid-killed ()
+  "A PID confirmed to be a same-uid Emacs is SIGTERMed and reported killed."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let ((now (float-time))
+         (signalled nil))
+     (cl-letf (((symbol-function 'process-attributes)
+                (lambda (_pid)
+                  (list (cons 'comm "emacs") (cons 'euid (user-uid)))))
+               ((symbol-function 'signal-process)
+                (lambda (pid sig) (push (cons pid sig) signalled) 0)))
+       (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
+                           :pid 4242 :display-mode 'host-inherit :init nil :attached nil
+                           :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (let ((dropped (emacs-devtools-mcp-spawn-kill "sp")))
+         (should (eq 'killed (plist-get dropped :kill-status))))
+       (should (member '(4242 . SIGTERM) signalled))))))
+
+(ert-deftest emacs-devtools-mcp-tests/spawn-kill-nil-pid-already-dead ()
+  "A non-attached record with no integer `:pid' is `already-dead', not signalled."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-empty-handles
+   (let ((now (float-time))
+         (signalled nil))
+     (cl-letf (((symbol-function 'signal-process)
+                (lambda (&rest _) (push t signalled) 0)))
+       (puthash "sp" (list :handle "sp" :server-name "edmcp-spawn-sp"
+                           :pid nil :display-mode 'host-inherit :init nil :attached nil
+                           :created now :last-used now)
+                emacs-devtools-mcp-spawn--handles)
+       (let ((dropped (emacs-devtools-mcp-spawn-kill "sp")))
+         (should (eq 'already-dead (plist-get dropped :kill-status))))
+       (should-not signalled)))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-reaper-skips-attached ()
   "Reaper leaves attached handles alone even when long past idle timeout.
@@ -3055,10 +3112,10 @@ to have been registered via `attach_emacs'."
   (emacs-devtools-mcp-tests--with-empty-handles
    (let* ((emacs-devtools-mcp-spawn-idle-timeout 60)
           (now (float-time))
-          (calls nil))
-     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
-                (lambda (_program args &optional _b)
-                  (push args calls) (cons 0 ""))))
+          (signalled nil))
+     (cl-letf (((symbol-function 'process-attributes) (lambda (_pid) nil))
+               ((symbol-function 'signal-process)
+                (lambda (pid _sig) (push pid signalled) 0)))
        (puthash "att-stale"
                 (list :handle "att-stale" :server-name "user-daemon"
                       :pid 1 :display-mode 'host-inherit :init nil :attached t
@@ -3076,23 +3133,20 @@ to have been registered via `attach_emacs'."
        ;; Spawned is reaped.
        (should-not (gethash "spawned-stale"
                             emacs-devtools-mcp-spawn--handles))
-       ;; No (kill-emacs) was sent against the attached daemon's name.
-       (should-not (cl-some (lambda (a) (member "user-daemon" a))
-                            calls))
-       ;; The spawned reap did call into emacsclient.
-       (should (cl-some (lambda (a)
-                          (member "edmcp-spawn-spawned-stale" a))
-                        calls))))))
+       ;; The attached daemon's PID was never signalled.
+       (should-not (member 1 signalled))
+       ;; The spawned reap SIGTERMed its PID.
+       (should (member 2 signalled))))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-kill-all-spares-attached ()
   "`spawn-kill-all' (run from `kill-emacs-hook') leaves attached daemons alive."
   :tags '(:fast)
   (emacs-devtools-mcp-tests--with-empty-handles
    (let ((now (float-time))
-         (calls nil))
-     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
-                (lambda (_program args &optional _b)
-                  (push args calls) (cons 0 ""))))
+         (signalled nil))
+     (cl-letf (((symbol-function 'process-attributes) (lambda (_pid) nil))
+               ((symbol-function 'signal-process)
+                (lambda (pid _sig) (push pid signalled) 0)))
        (puthash "att" (list :handle "att" :server-name "user-daemon"
                             :pid 1 :display-mode 'host-inherit :init nil :attached t
                             :created now :last-used now)
@@ -3102,11 +3156,8 @@ to have been registered via `attach_emacs'."
                            :created now :last-used now)
                 emacs-devtools-mcp-spawn--handles)
        (emacs-devtools-mcp-spawn-kill-all)
-       (should-not (cl-some (lambda (a) (member "user-daemon" a)) calls))
-       (should (cl-some (lambda (a)
-                          (and (member "edmcp-spawn-sp" a)
-                               (member "(kill-emacs)" a)))
-                        calls))))))
+       (should-not (member 1 signalled))
+       (should (member 2 signalled))))))
 
 (ert-deftest emacs-devtools-mcp-tests/spawn-attach-rejects-double-registration ()
   "`attach-emacs' refuses to register a daemon already tracked.
@@ -3134,8 +3185,8 @@ connect error.  The server name is the daemon's identity; refuse."
 (ert-deftest emacs-devtools-mcp-tests/spawn-tool-kill-status-field ()
   "`kill_spawn' tool envelope carries a `status' field distinguishing states.
 Three terminal states must be observable: `unknown_handle' (we
-never knew about it), `killed' (RPC succeeded), `already_dead'
-(handle was registered but its daemon did not answer).  The
+never knew about it), `killed' (SIGTERM reached the PID),
+`already_dead' (handle was registered but its PID is gone).  The
 older `already_gone' boolean stays for backwards compatibility,
 true only for `already_dead' so an unknown handle is
 distinguishable from a registered-but-dead one."
@@ -3149,10 +3200,11 @@ distinguishable from a registered-but-dead one."
           (text (plist-get (aref (plist-get env :content) 0) :text)))
      (should (string-match-p "\"status\":[ ]*\"unknown_handle\"" text))
      (should (string-match-p "\"already_gone\":[ ]*false" text)))
-   ;; Registered, RPC succeeds -> killed.
+   ;; Registered, SIGTERM lands -> killed.
    (let ((now (float-time)))
-     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
-                (lambda (&rest _) (cons 0 ""))))
+     (cl-letf (((symbol-function 'process-attributes) (lambda (_pid) nil))
+               ((symbol-function 'signal-process)
+                (lambda (&rest _) 0)))
        (puthash "live" (list :handle "live" :server-name "edmcp-spawn-live"
                              :pid 1 :display-mode 'host-inherit :init nil :attached nil
                              :created now :last-used now)
@@ -3166,8 +3218,9 @@ distinguishable from a registered-but-dead one."
          (should (string-match-p "\"already_gone\":[ ]*false" text)))))
    ;; Registered, RPC fails -> already_dead.
    (let ((now (float-time)))
-     (cl-letf (((symbol-function 'edmcp--spawn-call-process)
-                (lambda (&rest _) (cons 1 "no daemon"))))
+     (cl-letf (((symbol-function 'process-attributes) (lambda (_pid) nil))
+               ((symbol-function 'signal-process)
+                (lambda (&rest _) (error "No such process"))))
        (puthash "dead" (list :handle "dead" :server-name "edmcp-spawn-dead"
                              :pid 2 :display-mode 'host-inherit :init nil :attached nil
                              :created now :last-used now)
@@ -3572,11 +3625,38 @@ the queue rather than get a silently-guessed answer."
     (should (= 1 (length (plist-get res :prompts))))))
 
 (ert-deftest emacs-devtools-mcp-tests/eval-handler-answers-absent-unchanged ()
-  "Without `:answers' the plain runner is used; no `:prompts' key."
+  "Without `:answers' the no-prompt runner is used; no `:prompts' key.
+A non-prompting form returns exactly as before -- the guard is
+invisible unless a prompt actually fires."
   :tags '(:fast)
   (let ((res (edmcp--tools-eval-elisp '(:form "(* 2 3)"))))
     (should (equal "6" (plist-get res :value)))
     (should-not (plist-member res :prompts))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-no-answers-prompt-fails-fast ()
+  "Without `:answers', a prompting form fails fast instead of blocking.
+This is the consumer-proof guard: a form that calls `y-or-n-p',
+`read-string', etc. cannot wedge a single-threaded subordinate on a
+minibuffer read it has no way to answer -- it returns the prompt
+text as `:error' data with no `:value'."
+  :tags '(:fast)
+  (dolist (form '((y-or-n-p "proceed? ")
+                  (yes-or-no-p "really? ")
+                  (read-string "name: ")
+                  (read-from-minibuffer "path: ")
+                  (completing-read "pick: " '("a" "b"))
+                  (read-passwd "secret: ")))
+    (let ((res (emacs-devtools-mcp-tools-eval--run-no-prompt form 6 100)))
+      (should (string-match-p "no answers queue" (plist-get res :error)))
+      (should-not (plist-get res :value)))))
+
+(ert-deftest emacs-devtools-mcp-tests/eval-no-answers-prompt-text-redacted ()
+  "The blocked-prompt error redacts the prompt like the answers path."
+  :tags '(:fast)
+  (let ((res (emacs-devtools-mcp-tools-eval--run-no-prompt
+              '(y-or-n-p "auth-source-cache expired; refresh? ") 6 100)))
+    (should (string-match-p "no answers queue" (plist-get res :error)))
+    (should-not (string-match-p "auth-source" (plist-get res :error)))))
 
 (ert-deftest emacs-devtools-mcp-tests/eval-handler-bad-answers-raises-32602 ()
   "A non-boolean/string answers element is invalid params."
@@ -3692,6 +3772,19 @@ would then no longer round-trip through `edebug-uninstrument'."
   (let ((res (emacs-devtools-mcp-tools-eval--capture-backtrace
               '(error "boom-from-test") 6 100)))
     (should (string-match-p "boom-from-test" (plist-get res :error)))
+    (should (stringp (plist-get res :backtrace)))
+    (should (> (length (plist-get res :backtrace)) 0))
+    (should-not (plist-get res :value))))
+
+(ert-deftest emacs-devtools-mcp-tests/capture-backtrace-prompt-fails-fast ()
+  "A prompting FORM under `capture-backtrace' fails fast, not blocks.
+The guard signals, so the result carries :error (\"no answers
+queue\") and a populated :backtrace, with no :value -- it does not
+wait on minibuffer input that a subordinate daemon cannot answer."
+  :tags '(:fast)
+  (let ((res (emacs-devtools-mcp-tools-eval--capture-backtrace
+              '(y-or-n-p "go? ") 6 100)))
+    (should (string-match-p "no answers queue" (plist-get res :error)))
     (should (stringp (plist-get res :backtrace)))
     (should (> (length (plist-get res :backtrace)) 0))
     (should-not (plist-get res :value))))

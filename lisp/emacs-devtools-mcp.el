@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.4
+;; Package-Version: 0.1.5
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -29,7 +29,7 @@
 (require 'cl-lib)
 (require 'jsonrpc)
 
-(defconst emacs-devtools-mcp-version "0.1.4"
+(defconst emacs-devtools-mcp-version "0.1.5"
   "Current version of the `emacs-devtools-mcp' package.
 Must match the `Package-Version' header of this file; a `:fast'
 ERT test enforces the pairing so the release tag, the header, and

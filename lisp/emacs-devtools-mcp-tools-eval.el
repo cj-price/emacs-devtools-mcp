@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.4
+;; Package-Version: 0.1.5
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -85,6 +85,51 @@ the function without re-reading source from disk.")
 
 ;;;; eval-elisp.
 
+(defun edmcp--eval-prompt-blocked (kind prompt)
+  "Signal that interactive KIND reader hit PROMPT with no answers queue.
+The prompt text -- passed through the same prefix-anchored
+redaction as other output (`emacs-devtools-mcp-redact',
+best-effort) -- rides along as the error message so the caller
+learns what the form tried to ask and can retry with `answers'."
+  (error "Interactive %s prompt with no answers queue: %s"
+         kind
+         (or (emacs-devtools-mcp-redact (format "%s" prompt)) "")))
+
+(defmacro emacs-devtools-mcp-tools-eval--with-prompt-guard (&rest body)
+  "Run BODY with the interactive readers rebound to fail fast, not block.
+`y-or-n-p', `yes-or-no-p', `read-string', `read-from-minibuffer'
+\(the last also covering `completing-read' and `read-file-name',
+which read through it), and `read-passwd' each signal immediately
+via `edmcp--eval-prompt-blocked' instead of waiting on real input.
+A form that prompts then returns its prompt as `:error' data rather
+than wedging a single-threaded subordinate daemon forever.
+
+Scope: this guards the always-blocking minibuffer and password
+readers.  Terminal-event readers (`read-char', `read-event',
+`read-key') are deliberately not guarded -- they support a
+non-blocking SECONDS argument that legitimate forms use -- so the
+slow-tool `with-timeout' remains their backstop.  Supply an
+`answers' array to `eval-elisp' to answer prompts deterministically
+instead.  Kept self-contained so `emacs-devtools-mcp-spawn-call'
+can replay the guarded path inside a subordinate Emacs."
+  (declare (indent 0) (debug t))
+  `(cl-letf (((symbol-function 'y-or-n-p)
+              (lambda (prompt &rest _)
+                (edmcp--eval-prompt-blocked "y-or-n-p" prompt)))
+             ((symbol-function 'yes-or-no-p)
+              (lambda (prompt &rest _)
+                (edmcp--eval-prompt-blocked "yes-or-no-p" prompt)))
+             ((symbol-function 'read-string)
+              (lambda (prompt &rest _)
+                (edmcp--eval-prompt-blocked "read-string" prompt)))
+             ((symbol-function 'read-from-minibuffer)
+              (lambda (prompt &rest _)
+                (edmcp--eval-prompt-blocked "read-from-minibuffer" prompt)))
+             ((symbol-function 'read-passwd)
+              (lambda (prompt &rest _)
+                (edmcp--eval-prompt-blocked "read-passwd" prompt))))
+     ,@body))
+
 (defun emacs-devtools-mcp-tools-eval--run (form pl plen)
   "Evaluate FORM with `print-level' PL and `print-length' PLEN.
 Returns a plist with:
@@ -121,6 +166,15 @@ inside a subordinate Emacs when the call targets a spawn."
         ;; rest of the redaction layer.
         (append base (list :value (or (emacs-devtools-mcp-redact result)
                                       "")))))))
+
+(defun emacs-devtools-mcp-tools-eval--run-no-prompt (form pl plen)
+  "Evaluate FORM with PL/PLEN print caps under an interactive-prompt guard.
+Like `emacs-devtools-mcp-tools-eval--run', but any interactive
+prompt fails fast instead of blocking -- the default path for
+`eval-elisp' when the caller supplies no `answers' queue.  Kept
+self-contained for replay inside a subordinate Emacs."
+  (emacs-devtools-mcp-tools-eval--with-prompt-guard
+    (emacs-devtools-mcp-tools-eval--run form pl plen)))
 
 (defun emacs-devtools-mcp-tools-eval--run-with-answers (form pl plen answers)
   "Evaluate FORM with PL/PLEN print caps and canned prompt ANSWERS.
@@ -252,7 +306,7 @@ isolation."
            ',(edmcp--eval-normalize-answers answers-raw)))
       (emacs-devtools-mcp-spawn-call
        target
-       `(emacs-devtools-mcp-tools-eval--run ',form ,pl ,plen)))))
+       `(emacs-devtools-mcp-tools-eval--run-no-prompt ',form ,pl ,plen)))))
 
 ;;;; edebug-instrument / edebug-uninstrument.
 
@@ -357,7 +411,8 @@ the stack, so MCP dispatch frames (jsonrpc, `condition-case', the
 deftool wrappers) never leak into the returned backtrace.  Do not
 rename without updating `edmcp--capture-bt-plumbing' and the
 `eq' check in `edmcp--capture-bt-walk'."
-  (eval form t))
+  (emacs-devtools-mcp-tools-eval--with-prompt-guard
+    (eval form t)))
 
 (defun edmcp--capture-backtrace-format-frame (frame)
   "Format FRAME -- a (EVALD FUN ARGS FLAGS) tuple from `mapbacktrace'."
@@ -628,7 +683,9 @@ until the slow-tool timeout, and the result gains `prompts': a
 transcript of every prompt asked and the answer it consumed.  To
 discover what a form will ask, call once with `\"answers\": []'
 and read the transcript, then retry with the answers filled in.
-Without ANSWERS, prompts read real input and the timeout applies."
+Without ANSWERS, any interactive prompt also fails fast with its
+text in `error' rather than blocking -- a form cannot wedge a
+subordinate daemon on a minibuffer read it has no way to answer."
   :cost :slow
   :read-only nil
   :destructive t

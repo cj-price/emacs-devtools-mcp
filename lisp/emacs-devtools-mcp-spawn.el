@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.4
+;; Package-Version: 0.1.5
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -539,36 +539,57 @@ dangling against a dead server when the other is killed."
     (edmcp--spawn-ensure-reaper)
     rec))
 
+(defun edmcp--spawn-pid-foreign-p (pid)
+  "Return non-nil when PID is positively known to be a foreign process.
+Best-effort guard against PID reuse before signalling: a handle can
+outlive its daemon (out-of-band crash, manual kill) until the idle
+reaper sweeps it, and the OS may recycle the freed PID onto an
+unrelated process.  Returns t only when `process-attributes' gives
+positive evidence the PID is not a same-uid Emacs -- a different
+`euid', or a `comm' that does not name Emacs.  Absent or incomplete
+attributes return nil (proceed), so the SIGTERM still works on
+platforms that do not populate `process-attributes'."
+  (let ((attrs (ignore-errors (process-attributes pid))))
+    (when attrs
+      (let ((euid (alist-get 'euid attrs))
+            (comm (alist-get 'comm attrs)))
+        (or (and euid (not (eql euid (user-uid))))
+            (and comm (not (string-match-p "emacs" comm))))))))
+
 (defun emacs-devtools-mcp-spawn-kill (handle)
   "Drop HANDLE's record and, when not attached, kill its daemon.
 Returns the dropped record with an extra `:kill-status' field:
   `attached'     -- handle was registered via `spawn-attach'; the
                     user-owned daemon is left running.
-  `killed'       -- the daemon was terminated (RPC for the sync
-                    launchers, SIGTERM on the wrapper for the async
-                    `xvfb-run' launcher, which also tears down Xvfb).
-  `already-dead' -- the daemon was unreachable (RPC rc/=0 and no
-                    live wrapper process).
+  `killed'       -- the daemon was terminated (SIGTERM to its
+                    recorded PID for the sync launchers, SIGTERM on
+                    the wrapper for the async `xvfb-run' launcher,
+                    which also tears down Xvfb).
+  `already-dead' -- the daemon was unreachable (no live wrapper
+                    process, and the recorded PID is gone or has been
+                    recycled onto a non-Emacs/other-uid process).
+The PID is signalled directly rather than over `emacsclient' so a
+daemon wedged on a blocking read -- which would never service the
+RPC -- is still terminated and the handle always freed.  A
+`edmcp--spawn-pid-foreign-p' check guards against signalling a
+recycled PID now owned by an unrelated process.
 The status surfaces through the public `kill_spawn' tool so a client
 can tell `we never knew about it' apart from `we knew, we tried, it
 was already dead'."
   (let* ((rec (edmcp--spawn-lookup handle))
-         (server-name (plist-get rec :server-name))
          (proc (plist-get rec :proc))
+         (pid (plist-get rec :pid))
          (status
           (cond
            ((plist-get rec :attached) 'attached)
            ((and proc (process-live-p proc))
             (ignore-errors (kill-process proc))
             'killed)
-           (t
-            (let ((res (ignore-errors
-                         (edmcp--spawn-call-process
-                          emacs-devtools-mcp-spawn-emacsclient-program
-                          (list "-s" server-name "--eval" "(kill-emacs)")))))
-              (if (and (consp res) (zerop (car res)))
-                  'killed
-                'already-dead))))))
+           ((and (integerp pid)
+                 (not (edmcp--spawn-pid-foreign-p pid))
+                 (ignore-errors (zerop (signal-process pid 'SIGTERM))))
+            'killed)
+           (t 'already-dead))))
     (remhash handle emacs-devtools-mcp-spawn--handles)
     (when proc
       (let ((buf (process-buffer proc)))

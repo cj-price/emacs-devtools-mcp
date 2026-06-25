@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.4
+;; Package-Version: 0.1.5
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -63,8 +63,8 @@ returns ok rather than signaling, matching the
 The result distinguishes four terminal states via `:status':
   \"unknown_handle\" -- handle is not in the registry (never spawned,
                        already dropped by an earlier kill, or simply a typo),
-  \"killed\"         -- `(kill-emacs)' RPC succeeded,
-  \"already_dead\"   -- handle was registered but its daemon did not answer,
+  \"killed\"         -- SIGTERM reached the recorded PID (or wrapper),
+  \"already_dead\"   -- handle was registered but its PID is gone or recycled,
   \"attached\"       -- handle was attached; the user-owned daemon
                        is left running and the record is dropped.
 `already_gone' is true only for `already_dead' -- a registered handle
