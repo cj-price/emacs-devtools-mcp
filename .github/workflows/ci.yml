@@ -20,7 +20,7 @@ jobs:
     steps:
       - name: Check out
         # actions/checkout v6.0.3 (Node 24)
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Emacs ${{ matrix.emacs_version }}
         # purcell/setup-emacs master @ 2026-04-25
