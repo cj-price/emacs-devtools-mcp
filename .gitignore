@@ -4,6 +4,9 @@ eln-cache/
 /result
 /result-*
 .direnv/
+.devenv/
+.devenv.flake.nix
+devenv.local.nix
 .envrc.local
 
 # Editor scratch

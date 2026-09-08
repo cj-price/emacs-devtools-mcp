@@ -28,13 +28,16 @@ You need: Emacs ≥30.1, `socat`, and `jq`. Everything except
 tool needs a graphical Emacs build (for `x-export-frames`). `xvfb-run`
 lets you run `make test-gui` and lets `spawn_emacs` start a screenshot-
 capable subordinate daemon via `display_mode: "xvfb-run"`. The repo ships
-a `shell.nix` that pins all of those.
+a [devenv](https://devenv.sh) environment that pins all of those.
 
 ```sh
 git clone https://github.com/cj-price/emacs-devtools-mcp.git
 cd emacs-devtools-mcp
-nix-shell --run 'make all'   # byte-compile + ERT + checkdoc
+devenv shell -- make all   # byte-compile + ERT + checkdoc
 ```
+
+With [direnv](https://direnv.net) installed, `direnv allow` loads the
+environment automatically on `cd`, so plain `make all` just works.
 
 To make the server part of your Emacs:
 
@@ -65,7 +68,7 @@ End-to-end smoke against a fresh subordinate Emacs (no host attach
 required) — should end with `summary: PASS=N FAIL=0`:
 
 ```sh
-nix-shell --run 'make test-mcp'
+devenv shell -- make test-mcp
 ```
 
 ### Wire it into your agent

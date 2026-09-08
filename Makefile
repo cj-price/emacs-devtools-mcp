@@ -12,7 +12,7 @@
 #   clean        remove build artifacts
 #   install      symlink bin/emacs-devtools-mcp into ~/.local/bin
 #
-# Run inside `nix-shell` so the right Emacs and tooling are on PATH.
+# Run inside the `devenv` shell so the right Emacs and tooling are on PATH.
 
 EMACS        ?= emacs
 EMACSFLAGS   = -Q --batch
@@ -24,7 +24,7 @@ LISP_ELC     = $(LISP_SRC:.el=.elc)
 TEST_SRC     = $(wildcard $(TEST_DIR)/*.el)
 
 # CI / users can append extra -L paths via EXTRA_LOAD without losing the
-# defaults. Inside `nix-shell`, runtime deps are on the load-path already.
+# defaults. Inside the `devenv` shell, runtime deps are on the load-path already.
 EXTRA_LOAD   ?=
 LOAD_FLAGS   = -L $(LISP_DIR) -L $(TEST_DIR) $(EXTRA_LOAD)
 

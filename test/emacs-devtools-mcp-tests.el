@@ -264,7 +264,7 @@ verify the framing layer signals before any bytes are sent."
 (ert-deftest emacs-devtools-mcp-tests/rpc-property-random-chunking ()
   "Random envelopes split at random boundaries reconstruct losslessly.
 Stand-in for a propcheck generative test (propcheck is not in the
-nix-shell dependency set yet).  Twenty seeds, up to 10 messages,
+devenv dependency set yet).  Twenty seeds, up to 10 messages,
 chunks 1..32 bytes."
   :tags '(:fast)
   (emacs-devtools-mcp-tests--with-rpc (c)
@@ -317,7 +317,7 @@ chunks 1..32 bytes."
 (ert-deftest emacs-devtools-mcp-tests/rpc-real-cat-round-trip ()
   "End-to-end framing: bytes through `cat' come back and dispatch.
 Skipped when `cat' is not on PATH (should never happen in
-nix-shell, but the safety net is cheap)."
+the devenv shell, but the safety net is cheap)."
   :tags '(:fast)
   (skip-unless (executable-find "cat"))
   (let* ((received nil)
@@ -1285,7 +1285,7 @@ round-trip with `:array-type \\='array'."
 ;; `bin/emacs-devtools-mcp' POSIX-sh stdio<->socket relay.  Tests
 ;; spawn the relay as a subprocess, drive it via stdin/stdout, and
 ;; talk to a host server bound inside the test Emacs.  jq + socat are
-;; provided by `shell.nix'; tests skip when missing.
+;; provided by the devenv shell; tests skip when missing.
 
 (defconst emacs-devtools-mcp-tests--relay-path
   (expand-file-name

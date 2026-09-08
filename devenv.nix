@@ -1,7 +1,7 @@
-{ pkgs ? import <nixpkgs> {} }:
+{ pkgs, ... }:
 
-pkgs.mkShell {
-  buildInputs = with pkgs; [
+{
+  packages = with pkgs; [
     emacs31
     xvfb-run
     xorg-server
@@ -16,13 +16,13 @@ pkgs.mkShell {
     git
   ];
 
-  shellHook = ''
+  enterShell = ''
     echo "emacs-devtools-mcp dev shell"
-    echo "  emacs:     $(emacs --version | head -1)"
+    echo "  emacs:       $(emacs --version | head -1)"
     echo "  emacsclient: $(emacsclient --version | head -1)"
-    echo "  xvfb-run:  $(xvfb-run --help 2>&1 | head -1)"
-    echo "  socat:     $(socat -V 2>&1 | head -1)"
-    echo "  make:      $(make --version | head -1)"
+    echo "  xvfb-run:    $(xvfb-run --help 2>&1 | head -1)"
+    echo "  socat:       $(socat -V 2>&1 | head -1)"
+    echo "  make:        $(make --version | head -1)"
     echo ""
     echo "Targets:  make all | lisp | test | lint | clean"
   '';
