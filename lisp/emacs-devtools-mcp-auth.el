@@ -135,7 +135,7 @@ so per-repo fixtures load without editing the allowlist."
                             emacs-devtools-mcp-init-allowlist))))
     (when-let* ((proj (ignore-errors (project-current)))
                 (root (ignore-errors (project-root proj))))
-      (when-let ((c (edmcp--auth-canon-dir root)))
+      (when-let* ((c (edmcp--auth-canon-dir root)))
         (cl-pushnew c dirs :test #'equal)))
     dirs))
 

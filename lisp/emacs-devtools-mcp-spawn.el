@@ -512,7 +512,7 @@ daemon already tracked under SERVER-NAME -- the server name is the
 daemon's identity, and a second handle would just leave one strand
 dangling against a dead server when the other is killed."
   (edmcp--spawn-validate-server-name server-name)
-  (when-let ((existing (edmcp--spawn-find-by-server-name server-name)))
+  (when-let* ((existing (edmcp--spawn-find-by-server-name server-name)))
     (signal 'emacs-devtools-mcp-spawn-error
             (list (format "daemon %s already tracked under handle %s"
                           server-name existing))))

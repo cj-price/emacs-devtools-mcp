@@ -2,7 +2,7 @@
 
 pkgs.mkShell {
   buildInputs = with pkgs; [
-    emacs30
+    emacs31
     xvfb-run
     xorg-server
     socat

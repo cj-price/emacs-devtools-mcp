@@ -121,7 +121,7 @@ Host Emacs build is probed lazily on the first `screenshot-frame` call. The prob
 
 ## Build / test contract
 
-See the Makefile header for target definitions. CI: Emacs 30.1. `make all` + `make test-mcp` on every push. Build fails on any byte-compile or checkdoc warning.
+See the Makefile header for target definitions. CI: Emacs 31.1. `make all` + `make test-mcp` on every push. Build fails on any byte-compile or checkdoc warning.
 
 ## Tests
 
