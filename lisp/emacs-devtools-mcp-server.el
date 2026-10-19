@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.5
+;; Package-Version: 0.1.6
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -15,7 +15,7 @@
 ;; Hard-fails if `XDG_RUNTIME_DIR' is unset; never falls back to
 ;; `/tmp'.  Refuses to bind on top of a non-socket file, a symlink, or
 ;; a path owned by another uid.  Unlinks a stale socket (S_ISSOCK +
-;; same uid) and rebinds.
+;; same uid) and rebinds, but refuses to replace a live listener.
 
 ;;; Code:
 
@@ -95,7 +95,7 @@ with the socket path, not a new trust boundary."
     dir))
 
 (defun edmcp--server-validate-or-unlink (path)
-  "Validate any pre-existing PATH; unlink a stale socket; signal on hostile state."
+  "Validate PATH and unlink a stale socket, but never replace a live one."
   (when (file-exists-p path)
     (when (file-symlink-p path)
       (user-error "Refusing to bind: %s is a symlink" path))
@@ -109,6 +109,18 @@ with the socket path, not a new trust boundary."
                     path uid (user-uid)))
       (unless (and modes (eq (aref modes 0) ?s))
         (user-error "Refusing to bind: %s exists and is not a socket" path))
+      ;; Multiple Emacsen can load the same init file.  Rebinding a live
+      ;; listener strands its clients and rotates the token they use.
+      ;; A refused connection means the socket is stale; no listener
+      ;; remains to accept a connection on this path.
+      (let ((peer (condition-case nil
+                      (make-network-process
+                       :name "emacs-devtools-mcp-probe"
+                       :family 'local :service path :noquery t)
+                    (file-error nil))))
+        (when peer
+          (delete-process peer)
+          (user-error "Live MCP server at %s; use a distinct server name" path)))
       (delete-file path))))
 
 (defun edmcp--server-shutdown-soon (conn)

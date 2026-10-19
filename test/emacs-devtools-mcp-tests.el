@@ -436,6 +436,23 @@ the devenv shell, but the safety net is cheap)."
             (should (file-symlink-p path)))
         (ignore-errors (delete-file target))))))
 
+(ert-deftest emacs-devtools-mcp-tests/server-refuses-live-socket ()
+  "A second host must not unlink an active listener or rotate its token."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-server-env
+    (edmcp--server-ensure-dir)
+    (let* ((path (edmcp--server-socket-path))
+           (listener (make-network-process
+                      :name "edmcp-other-host"
+                      :family 'local :server t :service path :noquery t)))
+      (unwind-protect
+          (progn
+            (should-error (emacs-devtools-mcp-server-start) :type 'user-error)
+            (should (process-live-p listener))
+            (should (file-exists-p path))
+            (should-not emacs-devtools-mcp-server--process))
+        (delete-process listener)))))
+
 (ert-deftest emacs-devtools-mcp-tests/server-unlinks-stale-socket ()
   "A stale socket from a prior bind is unlinked and rebound cleanly."
   :tags '(:fast)

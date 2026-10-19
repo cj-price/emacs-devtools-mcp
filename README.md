@@ -95,7 +95,11 @@ configuration key.
 `EDMCP_NAME` selects the socket at `${XDG_RUNTIME_DIR}/edmcp/<NAME>.sock`
 and must match the host's `emacs-devtools-mcp-server-name` (both default
 to `"default"`). If you customize one, customize both — a mismatch shows
-up as the relay reporting `no socket at .../default.sock`.
+up as the relay reporting `no socket at .../default.sock`. Only one Emacs
+may serve a given name: a second Emacs refuses to replace a live socket.
+If your init starts several Emacsen, start the MCP server in just the
+intended host, or assign each instance a distinct name and match its
+relay's `EDMCP_NAME`.
 
 `make install` symlinks the relay to `~/.local/bin/emacs-devtools-mcp`
 if you'd rather keep the repo path out of your client config.
