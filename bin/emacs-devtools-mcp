@@ -59,16 +59,17 @@ for cmd in jq socat; do
   fi
 done
 
-# Read the first MCP frame from stdin, inject `_meta.token' if it is
-# an `initialize' request, forward the (possibly-modified) line, then
-# stream the rest of stdin through unchanged.
 {
-  if IFS= read -r first_line; then
-    printf '%s' "$first_line" \
-      | jq -c --arg tok "$TOKEN" \
-          'if type == "object" and (.method // "") == "initialize"
-           then .params = ((.params // {}) | ._meta = ((._meta // {}) | .token = $tok))
-           else . end'
-    cat
-  fi
+  while IFS= read -r line; do
+    method="$(printf '%s' "$line" \
+      | jq -r 'if type == "object" then .method // "" else "" end' \
+          2>/dev/null || true)"
+    if [ "$method" = "initialize" ]; then
+      printf '%s' "$line" \
+        | jq -c --arg tok "$TOKEN" \
+            '.params = ((.params // {}) | ._meta = ((._meta // {}) | .token = $tok))'
+      exec cat
+    fi
+    printf '%s\n' "$line"
+  done
 } | exec socat - UNIX-CONNECT:"$SOCK"

@@ -339,7 +339,9 @@ the reply."
   "Auth-gated request dispatcher for CONN.
 METHOD is a symbol; PARAMS a plist.  Until the connection is
 authenticated, only `initialize' with a matching `_meta.token' is
-accepted; everything else gets a JSON-RPC error and the
+accepted.  A `server/discover' probe gets \"method not found\" and
+the connection stays open so the client can fall back to
+`initialize'; everything else gets a JSON-RPC error and the
 connection is closed."
   (let ((proc (emacs-devtools-mcp-rpc--process conn)))
     (cond
@@ -362,6 +364,8 @@ connection is closed."
            (jsonrpc-name conn) "initialize: token mismatch")
           (edmcp--server-shutdown-soon conn)
           (jsonrpc-error :code -32600 :message "auth failed"))))
+     ((eq method 'server/discover)
+      (jsonrpc-error :code -32601 :message "Method not found"))
      (t
       (emacs-devtools-mcp-auth-log-failure
        (jsonrpc-name conn) (format "%s before initialize" method))
