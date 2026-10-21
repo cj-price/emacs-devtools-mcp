@@ -134,14 +134,19 @@ call() {
   esac
 }
 
-jq -nc '{jsonrpc:"2.0", id:"probe", method:"server/discover", params:{}}' >&3
-IFS= read -r -t 30 -u 4 probe_line
-probe_code="$(jq -r '.error.code // empty' <<<"$probe_line")"
-if [ "$probe_code" != "-32601" ]; then
-  echo "FAIL server/discover: $probe_line" >&2; exit 1
-fi
-echo "PASS server/discover      code=$probe_code"
-PASS=$((PASS + 1))
+for probe_id in probe-1 probe-2; do
+  jq -nc --arg id "$probe_id" \
+    '{jsonrpc:"2.0", id:$id, method:"server/discover", params:{}}' >&3
+  probe_line=""
+  IFS= read -r -t 30 -u 4 probe_line || true
+  if ! jq -e --arg id "$probe_id" \
+       '.id == $id and .error.code == -32601 and (has("result") | not)' \
+       <<<"$probe_line" >/dev/null 2>&1; then
+    echo "FAIL server/discover ($probe_id): ${probe_line:-<no reply>}" >&2; exit 1
+  fi
+  echo "PASS server/discover      id=$probe_id code=-32601"
+  PASS=$((PASS + 1))
+done
 
 # Phase 2: initialize through the relay.  The relay injects the
 # per-launch token from $TOKEN_FILE into params._meta.token of this

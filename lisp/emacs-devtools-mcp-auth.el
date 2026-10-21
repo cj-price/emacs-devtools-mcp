@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.6
+;; Package-Version: 0.1.7
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -12,9 +12,10 @@
 ;; Per-launch token + best-effort peer-uid check for the MCP socket.
 ;; A 32-byte random token is generated on each `server-start' and
 ;; persisted at `${XDG_RUNTIME_DIR}/edmcp/${NAME}.token' with mode
-;; 0600.  The first MCP frame on any accepted connection must be the
-;; standard `initialize' request whose params carry a matching token
-;; under `_meta.token' -- otherwise the connection is closed.
+;; 0600.  An accepted connection must send the standard `initialize'
+;; request with a matching token under `_meta.token' before anything
+;; else is served.  Only probe requests such as `server/discover' may
+;; come first; any other frame closes the connection.
 ;;
 ;; Stock Emacs does not expose `SO_PEERCRED' to Lisp, so the peer-uid
 ;; check degrades to relying on the directory mode (0700) and socket

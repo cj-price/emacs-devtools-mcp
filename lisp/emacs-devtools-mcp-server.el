@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  cj-price
 ;; Homepage: https://github.com/cj-price/emacs-devtools-mcp
 ;; Keywords: tools, convenience
-;; Package-Version: 0.1.6
+;; Package-Version: 0.1.7
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -53,6 +53,13 @@ emits `annotations' (`readOnlyHint' etc.), which the spec added in
 2025-03-26: every feature this server actually requires is in the
 older revision, clients must ignore unknown fields, and advertising
 the older version keeps strict 2024-11-05 clients connectable.")
+
+(defconst edmcp--server-pre-auth-probes '(server/discover)
+  "Request methods a client may send before `initialize'.
+Each gets a `-32601' method-not-found reply and the connection
+stays open, so a client that probes before the handshake can fall
+back to `initialize'.  Any other pre-auth frame closes the
+connection.")
 
 (defun edmcp--server-runtime-dir ()
   "Return `XDG_RUNTIME_DIR', or signal `user-error' if unset."
@@ -311,6 +318,11 @@ JSON-RPC error code."
                (edmcp--server-response-cap envelope))
             envelope)))))))
 
+(defun edmcp--server-method-not-found (method)
+  "Signal a JSON-RPC `-32601' method-not-found error for METHOD."
+  (jsonrpc-error :code -32601
+                 :message (format "Method not found: %s" method)))
+
 (defun emacs-devtools-mcp-server-default-dispatcher (conn method params)
   "Built-in post-auth dispatcher.
 CONN is the RPC connection; METHOD is a symbol; PARAMS a plist.
@@ -319,8 +331,7 @@ returns `-32601' method-not-found."
   (pcase method
     ('tools/list (edmcp--server-tools-list params))
     ('tools/call (edmcp--server-tools-call conn params))
-    (_ (jsonrpc-error :code -32601
-                      :message (format "Method not found: %s" method)))))
+    (_ (edmcp--server-method-not-found method))))
 
 (emacs-devtools-mcp-deftool ping
     "Smoke-test tool: replies with \"pong\".
@@ -339,10 +350,10 @@ the reply."
   "Auth-gated request dispatcher for CONN.
 METHOD is a symbol; PARAMS a plist.  Until the connection is
 authenticated, only `initialize' with a matching `_meta.token' is
-accepted.  A `server/discover' probe gets \"method not found\" and
-the connection stays open so the client can fall back to
-`initialize'; everything else gets a JSON-RPC error and the
-connection is closed."
+accepted.  A method in `edmcp--server-pre-auth-probes' gets
+method-not-found and the connection stays open so the client can
+fall back to `initialize'; everything else gets a JSON-RPC error
+and the connection is closed."
   (let ((proc (emacs-devtools-mcp-rpc--process conn)))
     (cond
      ((process-get proc 'edmcp-authenticated)
@@ -364,8 +375,8 @@ connection is closed."
            (jsonrpc-name conn) "initialize: token mismatch")
           (edmcp--server-shutdown-soon conn)
           (jsonrpc-error :code -32600 :message "auth failed"))))
-     ((eq method 'server/discover)
-      (jsonrpc-error :code -32601 :message "Method not found"))
+     ((memq method edmcp--server-pre-auth-probes)
+      (edmcp--server-method-not-found method))
      (t
       (emacs-devtools-mcp-auth-log-failure
        (jsonrpc-name conn) (format "%s before initialize" method))
@@ -377,8 +388,7 @@ connection is closed."
   "Auth-gated notification dispatcher for CONN.
 METHOD is a symbol; _PARAMS is unused (no notifications are
 acted upon today).  Drops anything received before authentication
-and closes the connection (per AC: any non-initialize first frame
-is rejected).  After auth, notifications are silently ignored."
+and closes the connection.  After auth, notifications are silently ignored."
   (let ((proc (emacs-devtools-mcp-rpc--process conn)))
     (unless (process-get proc 'edmcp-authenticated)
       (emacs-devtools-mcp-auth-log-failure

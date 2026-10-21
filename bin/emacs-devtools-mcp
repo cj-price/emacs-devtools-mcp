@@ -6,8 +6,8 @@
 # them to the host Emacs's Unix-domain socket at
 # `${XDG_RUNTIME_DIR}/edmcp/${EDMCP_NAME:-default}.sock', and writes
 # replies to stdout.  Injects the per-launch authentication token into
-# the first MCP frame's `params._meta.token' when that frame is an
-# `initialize' request.
+# `params._meta.token' of the first `initialize' request.  Lines before
+# it are forwarded unchanged; everything after it streams through.
 #
 # Hard-fails (no /tmp fallback) if `XDG_RUNTIME_DIR' is unset, the
 # socket is missing, or the token file is unreadable.

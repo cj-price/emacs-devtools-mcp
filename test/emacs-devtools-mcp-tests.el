@@ -753,6 +753,60 @@ BUF is a 1-element list mutated by the client filter."
                     client buf)))
         (should (eq -32600 (plist-get (plist-get reply :error) :code)))))))
 
+(ert-deftest emacs-devtools-mcp-tests/auth-discover-probe-keeps-connection ()
+  "A pre-auth `server/discover' gets -32601 and `initialize' still succeeds.
+MCP clients may probe with `server/discover' before the handshake
+and fall back to `initialize' on method-not-found; closing the
+connection on the probe strands them."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-server-env
+    (emacs-devtools-mcp-server-start)
+    (emacs-devtools-mcp-tests--with-client (client buf)
+      (emacs-devtools-mcp-tests--client-send
+       client '(:jsonrpc "2.0" :id "probe" :method "server/discover"
+                :params (:x 1)))
+      (let ((reply (emacs-devtools-mcp-tests--client-await-frame
+                    client buf)))
+        (should (equal "probe" (plist-get reply :id)))
+        (should-not (plist-get reply :result))
+        (should (eq -32601 (plist-get (plist-get reply :error) :code)))
+        (should (equal "Method not found: server/discover"
+                       (plist-get (plist-get reply :error) :message))))
+      (should (process-live-p client))
+      (let ((token emacs-devtools-mcp-auth--token))
+        (emacs-devtools-mcp-tests--client-send
+         client `(:jsonrpc "2.0" :id 1 :method "initialize"
+                  :params (:_meta (:token ,token))))
+        (should (plist-get
+                 (emacs-devtools-mcp-tests--client-await-frame client buf)
+                 :result))))))
+
+(ert-deftest emacs-devtools-mcp-tests/auth-discover-probe-does-not-authenticate ()
+  "After a pre-auth `server/discover', other requests are still rejected."
+  :tags '(:fast)
+  (emacs-devtools-mcp-tests--with-server-env
+    (emacs-devtools-mcp-server-start)
+    (emacs-devtools-mcp-tests--with-client (client buf)
+      (emacs-devtools-mcp-tests--client-send
+       client '(:jsonrpc "2.0" :id "probe" :method "server/discover"))
+      (should (eq -32601
+                  (plist-get
+                   (plist-get (emacs-devtools-mcp-tests--client-await-frame
+                               client buf)
+                              :error)
+                   :code)))
+      (emacs-devtools-mcp-tests--client-send
+       client '(:jsonrpc "2.0" :id 1 :method "tools/list"))
+      (should (eq -32600
+                  (plist-get
+                   (plist-get (emacs-devtools-mcp-tests--client-await-frame
+                               client buf)
+                              :error)
+                   :code)))
+      (with-timeout (3 (error "server did not close client"))
+        (while (process-live-p client)
+          (accept-process-output client 0.05))))))
+
 (ert-deftest emacs-devtools-mcp-tests/auth-check-token-constant-time-shape ()
   "`auth--check-token' rejects nil, wrong-length, and wrong-content; accepts equal."
   :tags '(:fast)

@@ -10,7 +10,7 @@ Agents speak newline-delimited JSON-RPC over stdio to `bin/emacs-devtools-mcp` (
 
 - Pure Elisp server runs **inside** the user's Emacs (no external runtime).
 - Relay socket lives at `${XDG_RUNTIME_DIR}/edmcp/${NAME}.sock` (mode `0600`). **Hard-fails if `XDG_RUNTIME_DIR` is unset; never falls back to `/tmp`.**
-- Peer auth: per-launch token in the first MCP frame, written to a 0600 sibling token file; relay reads + injects. In the absence of `SO_PEERCRED` from Lisp, the access boundary is the 0700 dir + 0600 socket/token files (filesystem-permission same-uid restriction); `emacs-devtools-mcp-auth--check-peer` is a stub awaiting a peer-cred API.
+- Peer auth: per-launch token in the first `initialize` frame, written to a 0600 sibling token file; relay reads + injects. In the absence of `SO_PEERCRED` from Lisp, the access boundary is the 0700 dir + 0600 socket/token files (filesystem-permission same-uid restriction); `emacs-devtools-mcp-auth--check-peer` is a stub awaiting a peer-cred API.
 - Every tool accepts an optional `target`: **always an object** — `{"host": true}` (default — the user's running Emacs) or `{"spawn": "<handle>"}` (subordinate Emacs from `emacs-devtools-mcp-spawn`). Never a string form.
 
 ## MCP framing — important
@@ -141,7 +141,7 @@ Prefer built-in Emacs APIs (`jsonrpc.el`'s abstract `jsonrpc-connection` class, 
 
 What's defended:
 - Socket: 0600 mode, in `${XDG_RUNTIME_DIR}/edmcp/`, hard-fail without `XDG_RUNTIME_DIR`.
-- Peer: per-launch token in first frame; access boundary is the 0700 dir + 0600 socket/token files (no `SO_PEERCRED` from Lisp).
+- Peer: per-launch token in the first `initialize` frame; pre-auth `server/discover` requests (`edmcp--server-pre-auth-probes`) get `-32601` and the connection stays open, any other pre-auth frame closes it; access boundary is the 0700 dir + 0600 socket/token files (no `SO_PEERCRED` from Lisp).
 - Stale socket: verified `S_ISSOCK` + same-uid + non-symlink before bind.
 - Subprocess: `make-process` argv lists everywhere; `[A-Za-z0-9_-]+` validation on `server_name`.
 - Reader injection: every `read` of untrusted text (subordinate `emacsclient --eval` replies, `bisect_init` predicate and init-file scan, `startup_profile` probe output, `ert_run` selector) is pre-scanned against the shared `emacs-devtools-mcp-unsafe-reader-re` and rejected on `#.` (read-time eval — Emacs has no documented switch to inhibit it), `#@` (reader skip), or `#N=`/`#N#` labels (shared-structure ~2^N print amplifier). One constant, so the rejected set cannot drift between read sites. The agent-supplied `form` in the eval tools is deliberately *not* scanned (unsandboxed by design), but note it is `read` host-side even when targeting a spawn — spawn targeting is routing, not isolation.
